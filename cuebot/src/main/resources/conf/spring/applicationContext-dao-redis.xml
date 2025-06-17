@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xmlns:redis="http://www.springframework.org/schema/redis"
+       xsi:schemaLocation="
+           http://www.springframework.org/schema/beans
+           http://www.springframework.org/schema/beans/spring-beans.xsd
+           http://www.springframework.org/schema/context
+           http://www.springframework.org/schema/context/spring-context.xsd
+           http://www.springframework.org/schema/redis
+           http://www.springframework.org/schema/redis/spring-redis.xsd">
+
+    <!-- Redis DAO Configuration - Active when 'redis' profile is enabled -->
+    
+    <!-- Component scanning for Redis DAOs -->
+    <context:component-scan base-package="com.imageworks.spcue.dao.redis">
+        <context:include-filter type="annotation" 
+                                expression="org.springframework.stereotype.Repository"/>
+    </context:component-scan>
+    
+    <!-- Redis Lua Script Beans -->
+    <bean id="findDispatchableFramesScript" 
+          class="com.imageworks.spcue.dao.redis.FindDispatchableFrames"/>
+    
+    <bean id="atomicBookingScript" 
+          class="com.imageworks.spcue.dao.redis.AtomicBookingScript"/>
+    
+    <bean id="bulkFrameUpdateScript" 
+          class="com.imageworks.spcue.dao.redis.BulkFrameUpdateScript"/>
+    
+    <!-- Redis Data Mapper -->
+    <bean id="redisDataMapper" 
+          class="com.imageworks.spcue.dao.redis.util.RedisDataMapper"/>
+    
+    <!-- Redis Key Builder -->
+    <bean id="redisKeyBuilder" 
+          class="com.imageworks.spcue.dao.redis.util.RedisKeyBuilder"/>
+    
+    <!-- Override SQL DAOs with Redis implementations when redis profile is active -->
+    <!-- These beans will replace the SQL implementations -->
+    <beans profile="redis">
+        
+        <!-- Job DAO -->
+        <bean id="jobDao" 
+              class="com.imageworks.spcue.dao.redis.JobDaoRedis"
+              primary="true"/>
+        
+        <!-- Layer DAO -->
+        <bean id="layerDao" 
+              class="com.imageworks.spcue.dao.redis.LayerDaoRedis"
+              primary="true"/>
+        
+        <!-- Frame DAO -->
+        <bean id="frameDao" 
+              class="com.imageworks.spcue.dao.redis.FrameDaoRedis"
+              primary="true"/>
+        
+        <!-- Host DAO -->
+        <bean id="hostDao" 
+              class="com.imageworks.spcue.dao.redis.HostDaoRedis"
+              primary="true"/>
+        
+        <!-- Proc DAO -->
+        <bean id="procDao" 
+              class="com.imageworks.spcue.dao.redis.ProcDaoRedis"
+              primary="true"/>
+        
+        <!-- Dispatcher DAO -->
+        <bean id="dispatcherDao" 
+              class="com.imageworks.spcue.dao.redis.DispatcherDaoRedis"
+              primary="true"/>
+        
+        <!-- Booking DAO -->
+        <bean id="bookingDao" 
+              class="com.imageworks.spcue.dao.redis.BookingDaoRedis"
+              primary="true"/>
+        
+        <!-- Redis Health Indicator -->
+        <bean id="redisHealthIndicator" 
+              class="org.springframework.boot.actuate.redis.RedisHealthIndicator">
+            <constructor-arg ref="redisConnectionFactory"/>
+        </bean>
+        
+        <!-- Redis Cache Manager -->
+        <bean id="cacheManager" 
+              class="org.springframework.data.redis.cache.RedisCacheManager">
+            <constructor-arg ref="redisTemplate"/>
+            <property name="defaultExpiration" value="3600"/>
+        </bean>
+        
+        <!-- Transaction Support for Redis -->
+        <bean id="redisTransactionManager" 
+              class="org.springframework.data.transaction.ChainedTransactionManager">
+            <constructor-arg>
+                <list>
+                    <ref bean="transactionManager"/>
+                </list>
+            </constructor-arg>
+        </bean>
+        
+    </beans>
+    
+    <!-- Monitoring and Metrics Beans -->
+    <bean id="redisMetricsCollector" 
+          class="com.imageworks.spcue.dao.redis.util.RedisMetricsCollector"
+          lazy-init="true">
+        <property name="enabled" value="${redis.metrics.enabled:true}"/>
+    </bean>
+    
+    <!-- Redis Connection Pool Monitor -->
+    <bean id="redisConnectionPoolMonitor" 
+          class="com.imageworks.spcue.dao.redis.util.RedisConnectionPoolMonitor"
+          lazy-init="true">
+        <property name="checkInterval" value="60000"/> <!-- 1 minute -->
+    </bean>
+    
+</beans>
