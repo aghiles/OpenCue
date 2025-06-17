@@ -1,12 +1,14 @@
 package com.imageworks.spcue.dao.redis;
 
 import com.imageworks.spcue.dao.JobDao;
+import com.imageworks.spcue.dao.DependDao;
 import com.imageworks.spcue.dao.redis.util.RedisKeyBuilder;
 import com.imageworks.spcue.dao.redis.util.RedisDataMapper;
 import com.imageworks.spcue.*;
 import com.imageworks.spcue.grpc.job.JobState;
 import com.imageworks.spcue.grpc.job.Job;
 import com.imageworks.spcue.util.CueUtil;
+import com.imageworks.spcue.depend.Depend;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -26,6 +28,9 @@ public class JobDaoRedis implements JobDao {
     
     @Autowired
     private RedisDataMapper redisDataMapper;
+    
+    @Autowired
+    private DependDao dependDao;
     
     @Override
     public JobDetail getJobDetail(String id) {
@@ -96,6 +101,13 @@ public class JobDaoRedis implements JobDao {
         
         // Add to dispatch queue
         updateJobDispatchQueue(job);
+        
+        // Set up frame dependencies if job has any
+        if (job.getDepends() != null && !job.getDepends().isEmpty()) {
+            for (Depend depend : job.getDepends()) {
+                dependDao.insertDepend(depend);
+            }
+        }
     }
     
     @Override

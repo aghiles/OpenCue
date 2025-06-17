@@ -29,35 +29,61 @@ for i = 3, #ARGV do
         if new_state == 'WAITING' then
             -- Transitioning frames to WAITING (e.g., retry operation)
             if current_state == 'DEAD' or current_state == 'DEPEND' then
-                -- Update frame state
-                redis.call('HMSET', frame_key,
-                    'state', 'WAITING',
-                    'state_time', timestamp
-                )
+                -- Check if dependencies are satisfied before making WAITING
+                local deps_satisfied = true
+                local deps_key = 'frame:deps:' .. frame_id
+                local depends_on_count = redis.call('SCARD', deps_key)
                 
-                -- Clear failure data
-                redis.call('HDEL', frame_key, 
-                    'exit_status', 
-                    'stop_time', 
-                    'proc_id', 
-                    'host_id', 
-                    'host_name'
-                )
+                if depends_on_count > 0 then
+                    local remaining_deps = redis.call('SMEMBERS', deps_key)
+                    for _, dep_frame_id in ipairs(remaining_deps) do
+                        local dep_frame_key = frame_prefix .. dep_frame_id
+                        local dep_state = redis.call('HGET', dep_frame_key, 'state')
+                        if dep_state ~= 'SUCCEEDED' and dep_state ~= 'EATEN' then
+                            deps_satisfied = false
+                            break
+                        end
+                    end
+                end
                 
-                -- Add back to dispatch queue
-                local priority = tonumber(redis.call('HGET', frame_key, 'priority') or '0')
-                local job_priority = tonumber(redis.call('HGET', frame_key, 'job_priority') or '0')
-                local layer_order = tonumber(redis.call('HGET', frame_key, 'layer_order') or '0')
-                local frame_number = tonumber(redis.call('HGET', frame_key, 'frame_number') or '0')
-                
-                -- Calculate dispatch score
-                local score = (job_priority * 1000000) + 
-                             (priority * 10000) + 
-                             ((100 - layer_order) * 100) + 
-                             (10000 - frame_number)
-                
-                redis.call('ZADD', queue_key, score, frame_id)
-                updated_count = updated_count + 1
+                if deps_satisfied then
+                    -- Update frame state
+                    redis.call('HMSET', frame_key,
+                        'state', 'WAITING',
+                        'state_time', timestamp
+                    )
+                    
+                    -- Clear failure data
+                    redis.call('HDEL', frame_key, 
+                        'exit_status', 
+                        'stop_time', 
+                        'proc_id', 
+                        'host_id', 
+                        'host_name'
+                    )
+                    
+                    -- Add back to dispatch queue
+                    local priority = tonumber(redis.call('HGET', frame_key, 'priority') or '0')
+                    local job_priority = tonumber(redis.call('HGET', frame_key, 'job_priority') or '0')
+                    local layer_order = tonumber(redis.call('HGET', frame_key, 'layer_order') or '0')
+                    local frame_number = tonumber(redis.call('HGET', frame_key, 'frame_number') or '0')
+                    
+                    -- Calculate dispatch score
+                    local score = (job_priority * 1000000) + 
+                                 (priority * 10000) + 
+                                 ((100 - layer_order) * 100) + 
+                                 (10000 - frame_number)
+                    
+                    redis.call('ZADD', queue_key, score, frame_id)
+                    updated_count = updated_count + 1
+                else
+                    -- Dependencies not satisfied, set to DEPEND state
+                    redis.call('HMSET', frame_key,
+                        'state', 'DEPEND',
+                        'state_time', timestamp
+                    )
+                    updated_count = updated_count + 1
+                end
             end
             
         elseif new_state == 'DEAD' then
@@ -102,6 +128,90 @@ for i = 3, #ARGV do
                 
                 -- Remove from dispatch queue
                 redis.call('ZREM', queue_key, frame_id)
+                
+                -- NEW: Update dependent frames when a frame is eaten
+                local dependents_key = 'frame:dependents:' .. frame_id
+                local dependents = redis.call('SMEMBERS', dependents_key)
+                
+                for _, dependent_frame_id in ipairs(dependents) do
+                    -- Remove this frame from dependent's dependency set
+                    local dep_key = 'frame:deps:' .. dependent_frame_id
+                    redis.call('SREM', dep_key, frame_id)
+                    
+                    -- Check if dependent can now be made WAITING
+                    local remaining_deps = redis.call('SCARD', dep_key)
+                    if remaining_deps == 0 then
+                        local dep_frame_key = frame_prefix .. dependent_frame_id
+                        local dep_state = redis.call('HGET', dep_frame_key, 'state')
+                        
+                        if dep_state == 'DEPEND' then
+                            -- Update to WAITING and add to queue
+                            redis.call('HSET', dep_frame_key, 'state', 'WAITING')
+                            
+                            local dep_priority = tonumber(redis.call('HGET', dep_frame_key, 'priority') or '0')
+                            local dep_job_priority = tonumber(redis.call('HGET', dep_frame_key, 'job_priority') or '0')
+                            local dep_layer_order = tonumber(redis.call('HGET', dep_frame_key, 'layer_order') or '0')
+                            local dep_frame_number = tonumber(redis.call('HGET', dep_frame_key, 'frame_number') or '0')
+                            
+                            local dep_score = (dep_job_priority * 1000000) + 
+                                            (dep_priority * 10000) + 
+                                            ((100 - dep_layer_order) * 100) + 
+                                            (10000 - dep_frame_number)
+                            
+                            redis.call('ZADD', queue_key, dep_score, dependent_frame_id)
+                        end
+                    end
+                end
+                
+                updated_count = updated_count + 1
+            end
+            
+        elseif new_state == 'SUCCEEDED' then
+            -- Frame completed successfully
+            if current_state == 'RUNNING' then
+                redis.call('HMSET', frame_key,
+                    'state', 'SUCCEEDED',
+                    'state_time', timestamp
+                )
+                
+                -- Clear booking
+                local booking_key = booking_prefix .. frame_id
+                redis.call('DEL', booking_key)
+                
+                -- NEW: Update dependent frames
+                local dependents_key = 'frame:dependents:' .. frame_id
+                local dependents = redis.call('SMEMBERS', dependents_key)
+                
+                for _, dependent_frame_id in ipairs(dependents) do
+                    -- Remove this frame from dependent's dependency set
+                    local dep_key = 'frame:deps:' .. dependent_frame_id
+                    redis.call('SREM', dep_key, frame_id)
+                    
+                    -- Check if dependent can now be made WAITING
+                    local remaining_deps = redis.call('SCARD', dep_key)
+                    if remaining_deps == 0 then
+                        local dep_frame_key = frame_prefix .. dependent_frame_id
+                        local dep_state = redis.call('HGET', dep_frame_key, 'state')
+                        
+                        if dep_state == 'DEPEND' then
+                            -- Update to WAITING and add to queue
+                            redis.call('HSET', dep_frame_key, 'state', 'WAITING')
+                            
+                            local dep_priority = tonumber(redis.call('HGET', dep_frame_key, 'priority') or '0')
+                            local dep_job_priority = tonumber(redis.call('HGET', dep_frame_key, 'job_priority') or '0')
+                            local dep_layer_order = tonumber(redis.call('HGET', dep_frame_key, 'layer_order') or '0')
+                            local dep_frame_number = tonumber(redis.call('HGET', dep_frame_key, 'frame_number') or '0')
+                            
+                            local dep_score = (dep_job_priority * 1000000) + 
+                                            (dep_priority * 10000) + 
+                                            ((100 - dep_layer_order) * 100) + 
+                                            (10000 - dep_frame_number)
+                            
+                            redis.call('ZADD', queue_key, dep_score, dependent_frame_id)
+                        end
+                    end
+                end
+                
                 updated_count = updated_count + 1
             end
             

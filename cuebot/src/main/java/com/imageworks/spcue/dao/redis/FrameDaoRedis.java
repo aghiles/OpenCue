@@ -1,6 +1,7 @@
 package com.imageworks.spcue.dao.redis;
 
 import com.imageworks.spcue.dao.FrameDao;
+import com.imageworks.spcue.dao.DependDao;
 import com.imageworks.spcue.dao.redis.util.RedisKeyBuilder;
 import com.imageworks.spcue.dao.redis.util.RedisDataMapper;
 import com.imageworks.spcue.*;
@@ -27,6 +28,9 @@ public class FrameDaoRedis implements FrameDao {
     
     @Autowired
     private BulkFrameUpdateScript bulkFrameUpdateScript;
+    
+    @Autowired
+    private DependDao dependDao;
     
     @Override
     public FrameDetail getFrameDetail(String frameId) {
@@ -139,6 +143,11 @@ public class FrameDaoRedis implements FrameDao {
         // Clear booking
         String bookingKey = RedisKeyBuilder.booking(frame.getFrameId());
         redisTemplate.delete(bookingKey);
+        
+        // If frame succeeded/eaten, mark complete for dependencies
+        if (state == FrameState.SUCCEEDED || state == FrameState.EATEN) {
+            dependDao.markFrameComplete(frame.getFrameId());
+        }
     }
     
     @Override
@@ -166,12 +175,37 @@ public class FrameDaoRedis implements FrameDao {
         List<String> frameIds = getFrameIdsForLayer(layerId);
         
         if (!frameIds.isEmpty()) {
-            bulkFrameUpdateScript.markFramesWaiting(
-                redisTemplate,
-                frameIds,
-                layer.getShowId(),
-                layer.getFacilityId()
-            );
+            // Check each frame for dependencies
+            List<String> waitingFrames = new ArrayList<>();
+            List<String> dependFrames = new ArrayList<>();
+            
+            for (String frameId : frameIds) {
+                if (dependDao.satisfiesDepends(frameId)) {
+                    // No dependencies or all satisfied
+                    waitingFrames.add(frameId);
+                } else {
+                    // Has unsatisfied dependencies
+                    dependFrames.add(frameId);
+                }
+            }
+            
+            // Bulk update WAITING frames
+            if (!waitingFrames.isEmpty()) {
+                bulkFrameUpdateScript.markFramesWaiting(
+                    redisTemplate,
+                    waitingFrames,
+                    layer.getShowId(),
+                    layer.getFacilityId()
+                );
+            }
+            
+            // Set DEPEND state for frames with dependencies
+            for (String frameId : dependFrames) {
+                String frameKey = RedisKeyBuilder.frame(frameId);
+                redisTemplate.opsForHash().put(frameKey, "state", "DEPEND");
+                redisTemplate.opsForHash().put(frameKey, "state_time", 
+                    String.valueOf(System.currentTimeMillis()));
+            }
         }
     }
     

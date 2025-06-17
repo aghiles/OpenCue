@@ -36,6 +36,24 @@ if frame_state ~= 'WAITING' then
     return false
 end
 
+-- NEW: Verify dependencies are satisfied
+local deps_key = 'frame:deps:' .. frame_id
+local depends_on_count = redis.call('SCARD', deps_key)
+
+if depends_on_count > 0 then
+    -- Has dependencies, verify they're all satisfied
+    local remaining_deps = redis.call('SMEMBERS', deps_key)
+    for _, dep_frame_id in ipairs(remaining_deps) do
+        local dep_frame_key = 'frame:' .. dep_frame_id
+        local dep_state = redis.call('HGET', dep_frame_key, 'state')
+        if dep_state ~= 'SUCCEEDED' and dep_state ~= 'EATEN' then
+            -- Dependency not satisfied, cannot book
+            redis.call('HINCRBY', 'stats:booking', 'dependency_blocks', 1)
+            return false
+        end
+    end
+end
+
 -- Atomic booking operation
 -- 1. Create booking record (with TTL to prevent stuck bookings)
 redis.call('SETEX', booking_key, 86400, proc_id) -- 24 hour TTL

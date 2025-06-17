@@ -232,4 +232,22 @@ public class RedisKeyBuilder {
     public static String serviceHosts(String serviceName) {
         return "service" + SEPARATOR + serviceName + SEPARATOR + "hosts";
     }
+
+    // Dependency keys 
+    public static String frameDependencies(String frameId) {
+        return "frame" + SEPARATOR + "deps" + SEPARATOR + frameId;
+    }
+
+    public static String frameDependents(String frameId) {
+        return "frame" + SEPARATOR + "dependents" + SEPARATOR + frameId;
+    }
+
+    public static String depend(String dependId) {
+        return "depend" + SEPARATOR + dependId;
+    }
+
+    // Also add this if not already present:
+    public static String frameDependenciesPrefix() {
+        return "frame" + SEPARATOR + "deps" + SEPARATOR;
+    }
 }

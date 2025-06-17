@@ -1,5 +1,5 @@
 -- find_dispatchable_frames.lua
--- Finds frames ready for dispatch based on resource requirements
+-- Finds frames ready for dispatch based on resource requirements and dependencies
 -- Replaces complex SQL query with 6+ JOINs
 
 -- KEYS[1]: dispatch:queue:{facility_id} (sorted set)
@@ -107,36 +107,56 @@ for _, frame_id in ipairs(frame_ids) do
                     local not_paused = frame.job_paused ~= 'true'
                     
                     if service_match and show_active and not_paused then
-                        -- Frame is dispatchable! Add to results
-                        frame.frame_id = frame_id
+                        -- NEW: Check dependencies
+                        local deps_satisfied = true
+                        local deps_key = 'frame:deps:' .. frame_id
+                        local depends_on_count = redis.call('SCARD', deps_key)
                         
-                        -- Include dispatch-relevant fields in result
-                        local dispatch_frame = {
-                            frame_id = frame_id,
-                            frame_name = frame.frame_name,
-                            job_id = frame.job_id,
-                            job_name = frame.job_name,
-                            layer_id = frame.layer_id,
-                            layer_name = frame.layer_name,
-                            show_id = frame.show_id,
-                            facility_id = frame.facility_id,
-                            priority = tonumber(frame.priority) or 0,
-                            cores_min = cores_min,
-                            memory_min = memory_min,
-                            gpu_min = gpu_min,
-                            state = frame.state,
-                            frame_number = tonumber(frame.frame_number) or 0,
-                            layer_order = tonumber(frame.layer_order) or 0,
-                            command = frame.command,
-                            services = frame.services
-                        }
+                        if depends_on_count > 0 then
+                            -- Has dependencies, need to check them
+                            local remaining_deps = redis.call('SMEMBERS', deps_key)
+                            for _, dep_frame_id in ipairs(remaining_deps) do
+                                local dep_frame_key = frame_prefix .. dep_frame_id
+                                local dep_state = redis.call('HGET', dep_frame_key, 'state')
+                                if dep_state ~= 'SUCCEEDED' and dep_state ~= 'EATEN' then
+                                    deps_satisfied = false
+                                    break
+                                end
+                            end
+                        end
                         
-                        -- Convert to JSON and add to results
-                        local frame_json = table_to_json(dispatch_frame)
-                        table.insert(results, frame_json)
-                        
-                        if #results >= limit then
-                            break
+                        if deps_satisfied then
+                            -- Frame is dispatchable! Add to results
+                            frame.frame_id = frame_id
+                            
+                            -- Include dispatch-relevant fields in result
+                            local dispatch_frame = {
+                                frame_id = frame_id,
+                                frame_name = frame.frame_name,
+                                job_id = frame.job_id,
+                                job_name = frame.job_name,
+                                layer_id = frame.layer_id,
+                                layer_name = frame.layer_name,
+                                show_id = frame.show_id,
+                                facility_id = frame.facility_id,
+                                priority = tonumber(frame.priority) or 0,
+                                cores_min = cores_min,
+                                memory_min = memory_min,
+                                gpu_min = gpu_min,
+                                state = frame.state,
+                                frame_number = tonumber(frame.frame_number) or 0,
+                                layer_order = tonumber(frame.layer_order) or 0,
+                                command = frame.command,
+                                services = frame.services
+                            }
+                            
+                            -- Convert to JSON and add to results
+                            local frame_json = table_to_json(dispatch_frame)
+                            table.insert(results, frame_json)
+                            
+                            if #results >= limit then
+                                break
+                            end
                         end
                     end
                 end

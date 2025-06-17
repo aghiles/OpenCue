@@ -57,4 +57,10 @@ public class RedisConfig {
         
         return template;
     }
+
+    @Bean
+    @Primary
+    public DependDao dependDao(@Autowired DependencyDaoRedis dependencyDaoRedis) {
+        return dependencyDaoRedis;
+    }
 }
