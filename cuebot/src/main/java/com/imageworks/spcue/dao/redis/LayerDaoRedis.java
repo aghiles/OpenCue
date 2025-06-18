@@ -1,6 +1,7 @@
 package com.imageworks.spcue.dao.redis;
 
 import com.imageworks.spcue.dao.LayerDao;
+import com.imageworks.spcue.dao.DependDao;
 import com.imageworks.spcue.dao.redis.util.RedisKeyBuilder;
 import com.imageworks.spcue.dao.redis.util.RedisDataMapper;
 import com.imageworks.spcue.*;
@@ -8,6 +9,7 @@ import com.imageworks.spcue.grpc.job.LayerType;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Repository;
 import org.springframework.context.annotation.Profile;
 
@@ -23,6 +25,9 @@ public class LayerDaoRedis implements LayerDao {
     
     @Autowired
     private RedisDataMapper redisDataMapper;
+    
+    @Autowired
+    private DependDao dependDao;
     
     @Override
     public LayerDetail getLayerDetail(String id) {
@@ -76,6 +81,10 @@ public class LayerDaoRedis implements LayerDao {
         layerData.put("enabled", String.valueOf(true));
         layerData.put("command", layer.getCommand());
         
+        // NEW: Set layer as inactive by default (will be activated when dependencies are met)
+        layerData.put("active", "false");
+        layerData.put("is_complete", "false");
+        
         redisTemplate.opsForHash().putAll(layerKey, layerData);
         
         // Create indexes
@@ -98,6 +107,9 @@ public class LayerDaoRedis implements LayerDao {
             String limitsKey = RedisKeyBuilder.layerLimits(layerId);
             redisTemplate.opsForSet().add(limitsKey, layer.getLimits());
         }
+        
+        // Check if layer should be active immediately (no dependencies)
+        checkLayerActivation(layerId);
     }
     
     @Override
@@ -157,6 +169,11 @@ public class LayerDaoRedis implements LayerDao {
         
         // Update all frames
         updateFrameRequirements(layer.getLayerId(), "layer_enabled", String.valueOf(enabled));
+        
+        // If enabling, check if layer should be activated
+        if (enabled) {
+            checkLayerActivation(layer.getLayerId());
+        }
     }
     
     @Override
@@ -217,22 +234,18 @@ public class LayerDaoRedis implements LayerDao {
         stats.put("updated_time", String.valueOf(System.currentTimeMillis()));
         
         redisTemplate.opsForHash().putAll(statsKey, stats);
+        
+        // Check if layer is complete
+        if ((succeededFrames + eatenFrames) >= totalFrames && totalFrames > 0) {
+            markLayerComplete(layer.getLayerId());
+        }
     }
     
     @Override
     public boolean isLayerComplete(LayerInterface layer) {
-        String statsKey = RedisKeyBuilder.layerStats(layer.getLayerId());
-        Map<Object, Object> stats = redisTemplate.opsForHash().entries(statsKey);
-        
-        if (stats.isEmpty()) {
-            return false;
-        }
-        
-        long total = Long.parseLong(stats.getOrDefault("total_frames", "0").toString());
-        long succeeded = Long.parseLong(stats.getOrDefault("succeeded_frames", "0").toString());
-        long eaten = Long.parseLong(stats.getOrDefault("eaten_frames", "0").toString());
-        
-        return (succeeded + eaten) >= total;
+        String layerKey = RedisKeyBuilder.layer(layer.getLayerId());
+        String isComplete = (String) redisTemplate.opsForHash().get(layerKey, "is_complete");
+        return "true".equals(isComplete);
     }
     
     @Override
@@ -246,6 +259,108 @@ public class LayerDaoRedis implements LayerDao {
             if (memory > currentMin) {
                 redisTemplate.opsForHash().put(layerKey, "memory_min", String.valueOf(memory));
                 updateFrameRequirements(layer.getLayerId(), "memory_min", String.valueOf(memory));
+            }
+        }
+    }
+    
+    // NEW: Activate layer when dependencies are satisfied
+    public void activateLayer(String layerId) {
+        String activateScript = 
+            "local layer_key = KEYS[1]\n" +
+            "local dispatch_queue = KEYS[2]\n" +
+            "local frame_prefix = KEYS[3]\n" +
+            "\n" +
+            "-- Mark layer as active\n" +
+            "redis.call('HSET', layer_key, 'active', 'true')\n" +
+            "redis.call('HSET', layer_key, 'activated_time', ARGV[1])\n" +
+            "\n" +
+            "-- Get all frames for this layer\n" +
+            "local pattern = frame_prefix .. '*:' .. ARGV[2] .. ':*'\n" +
+            "local frame_keys = redis.call('KEYS', pattern)\n" +
+            "\n" +
+            "local activated = 0\n" +
+            "for _, frame_key in ipairs(frame_keys) do\n" +
+            "  local state = redis.call('HGET', frame_key, 'state')\n" +
+            "  if state == 'DEPEND' then\n" +
+            "    -- Check frame-specific dependencies\n" +
+            "    local frame_id = string.match(frame_key, 'frame:(.+)')\n" +
+            "    local deps_key = 'frame:deps:' .. frame_id\n" +
+            "    local has_deps = redis.call('SCARD', deps_key)\n" +
+            "    \n" +
+            "    if has_deps == 0 then\n" +
+            "      -- No frame dependencies, activate it\n" +
+            "      redis.call('HSET', frame_key, 'state', 'WAITING')\n" +
+            "      \n" +
+            "      -- Add to dispatch queue\n" +
+            "      local priority = tonumber(redis.call('HGET', frame_key, 'priority') or '0')\n" +
+            "      local job_priority = tonumber(redis.call('HGET', frame_key, 'job_priority') or '0')\n" +
+            "      local layer_order = tonumber(redis.call('HGET', frame_key, 'layer_order') or '0')\n" +
+            "      local frame_number = tonumber(redis.call('HGET', frame_key, 'frame_number') or '0')\n" +
+            "      \n" +
+            "      local score = (job_priority * 1000000) + (priority * 10000) + ((100 - layer_order) * 100) + (10000 - frame_number)\n" +
+            "      redis.call('ZADD', dispatch_queue, score, frame_id)\n" +
+            "      activated = activated + 1\n" +
+            "    end\n" +
+            "  end\n" +
+            "end\n" +
+            "\n" +
+            "return activated";
+        
+        String layerKey = RedisKeyBuilder.layer(layerId);
+        Object facilityId = redisTemplate.opsForHash().get(layerKey, "facility_id");
+        
+        if (facilityId != null) {
+            redisTemplate.execute(
+                new DefaultRedisScript<>(activateScript, Long.class),
+                Arrays.asList(
+                    layerKey,
+                    RedisKeyBuilder.dispatchQueue(facilityId.toString()),
+                    RedisKeyBuilder.framePrefix()
+                ),
+                String.valueOf(System.currentTimeMillis()),
+                layerId
+            );
+        }
+    }
+    
+    // NEW: Get blocked layers
+    public List<LayerInterface> getBlockedLayers() {
+        String blockedLayersKey = RedisKeyBuilder.blockedLayers();
+        Set<String> layerIds = redisTemplate.opsForSet().members(blockedLayersKey);
+        
+        if (layerIds == null || layerIds.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        return layerIds.stream()
+            .map(this::getLayer)
+            .filter(Objects::nonNull)
+            .collect(Collectors.toList());
+    }
+    
+    private void markLayerComplete(String layerId) {
+        String layerKey = RedisKeyBuilder.layer(layerId);
+        redisTemplate.opsForHash().put(layerKey, "is_complete", "true");
+        redisTemplate.opsForHash().put(layerKey, "complete_time", String.valueOf(System.currentTimeMillis()));
+        
+        // Trigger dependency checks via DependDao
+        if (dependDao instanceof DependencyDaoRedis) {
+            ((DependencyDaoRedis) dependDao).onLayerComplete(layerId);
+        }
+    }
+    
+    private void checkLayerActivation(String layerId) {
+        if (dependDao instanceof DependencyDaoRedis) {
+            DependencyDaoRedis depDao = (DependencyDaoRedis) dependDao;
+            if (depDao.checkLayerDependencies(layerId)) {
+                // No dependencies or all satisfied - activate immediately
+                String layerKey = RedisKeyBuilder.layer(layerId);
+                redisTemplate.opsForHash().put(layerKey, "active", "true");
+                redisTemplate.opsForHash().put(layerKey, "blocked_by_depends", "false");
+            } else {
+                // Has unsatisfied dependencies
+                String blockedLayersKey = RedisKeyBuilder.blockedLayers();
+                redisTemplate.opsForSet().add(blockedLayersKey, layerId);
             }
         }
     }

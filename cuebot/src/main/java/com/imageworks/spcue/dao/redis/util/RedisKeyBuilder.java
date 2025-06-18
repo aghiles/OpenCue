@@ -32,6 +32,10 @@ public class RedisKeyBuilder {
         return "job" + SEPARATOR + jobId;
     }
     
+    public static String jobPrefix() {
+        return "job" + SEPARATOR;
+    }
+    
     public static String jobPattern() {
         return "job" + SEPARATOR + "*";
     }
@@ -52,9 +56,21 @@ public class RedisKeyBuilder {
         return "job" + SEPARATOR + jobId + SEPARATOR + "lha";
     }
     
+    public static String jobDependencies(String jobId) {
+        return "job" + SEPARATOR + "deps" + SEPARATOR + jobId;
+    }
+    
+    public static String jobDependents(String jobId) {
+        return "job" + SEPARATOR + "dependents" + SEPARATOR + jobId;
+    }
+    
     // Layer keys
     public static String layer(String layerId) {
         return "layer" + SEPARATOR + layerId;
+    }
+    
+    public static String layerPrefix() {
+        return "layer" + SEPARATOR;
     }
     
     public static String layerPattern(String jobId) {
@@ -83,6 +99,18 @@ public class RedisKeyBuilder {
     
     public static String layerTags(String layerId) {
         return "layer" + SEPARATOR + layerId + SEPARATOR + "tags";
+    }
+    
+    public static String layerDependencies(String layerId) {
+        return "layer" + SEPARATOR + "deps" + SEPARATOR + layerId;
+    }
+    
+    public static String layerDependents(String layerId) {
+        return "layer" + SEPARATOR + "dependents" + SEPARATOR + layerId;
+    }
+    
+    public static String layerActive(String layerId) {
+        return "layer" + SEPARATOR + "active" + SEPARATOR + layerId;
     }
     
     // Host keys
@@ -167,6 +195,10 @@ public class RedisKeyBuilder {
         return "dispatch" + SEPARATOR + "jobs" + SEPARATOR;
     }
     
+    public static String blockedLayers() {
+        return "dispatch" + SEPARATOR + "blocked" + SEPARATOR + "layers";
+    }
+    
     // Active hosts sorted set
     public static String activeHosts() {
         return "active" + SEPARATOR + "hosts";
@@ -232,22 +264,30 @@ public class RedisKeyBuilder {
     public static String serviceHosts(String serviceName) {
         return "service" + SEPARATOR + serviceName + SEPARATOR + "hosts";
     }
-
-    // Dependency keys 
+    
+    // Dependency keys
     public static String frameDependencies(String frameId) {
         return "frame" + SEPARATOR + "deps" + SEPARATOR + frameId;
     }
-
+    
+    public static String frameDependenciesPrefix() {
+        return "frame" + SEPARATOR + "deps" + SEPARATOR;
+    }
+    
     public static String frameDependents(String frameId) {
         return "frame" + SEPARATOR + "dependents" + SEPARATOR + frameId;
     }
-
+    
     public static String depend(String dependId) {
         return "depend" + SEPARATOR + dependId;
     }
-
-    // Also add this if not already present:
-    public static String frameDependenciesPrefix() {
-        return "frame" + SEPARATOR + "deps" + SEPARATOR;
+    
+    // Layer frame management
+    public static String layerFrames(String layerId) {
+        return "layer" + SEPARATOR + "frames" + SEPARATOR + layerId;
+    }
+    
+    public static String jobFrames(String jobId) {
+        return "job" + SEPARATOR + "frames" + SEPARATOR + jobId;
     }
 }
