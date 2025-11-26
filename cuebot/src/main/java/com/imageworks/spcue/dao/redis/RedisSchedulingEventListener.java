@@ -19,6 +19,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
@@ -30,8 +31,17 @@ import java.util.Map;
 
 /**
  * Listens for entity change events and syncs them to Redis.
- * Uses @TransactionalEventListener to ensure sync happens only after
- * the SQL transaction commits successfully.
+ *
+ * Uses @TransactionalEventListener(AFTER_COMMIT) to ensure sync happens
+ * only after the SQL transaction commits successfully.
+ *
+ * Uses @Async to make Redis sync non-blocking - the main thread continues
+ * immediately while Redis operations happen in the background.
+ *
+ * This ensures:
+ * 1. SQL is always the source of truth
+ * 2. Redis is eventually consistent (after commit)
+ * 3. No performance impact on the main dispatch path
  */
 @Component
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -57,6 +67,7 @@ public class RedisSchedulingEventListener {
      * - When frame becomes WAITING: add to waiting sorted set
      * - When frame leaves WAITING: remove from waiting sorted set
      */
+    @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onFrameStateChanged(FrameStateChangedEvent event) {
         String frameId = event.getFrameId();
@@ -105,6 +116,7 @@ public class RedisSchedulingEventListener {
     /**
      * Handle layer updates - store layer resource requirements.
      */
+    @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onLayerUpdated(LayerUpdatedEvent event) {
         String layerId = event.getLayerId();
@@ -159,6 +171,7 @@ public class RedisSchedulingEventListener {
     /**
      * Handle job completion - clean up Redis data.
      */
+    @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onJobCompleted(RedisSchedulingEventPublisher.JobCompletedEvent event) {
         cleanupJob(event.getJobId());

@@ -28,15 +28,21 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.scripting.support.ResourceScriptSource;
 
 import java.util.List;
+import java.util.concurrent.Executor;
 
 /**
  * Redis configuration for scheduling cache.
  * Only loaded when redis.scheduling.enabled=true
+ *
+ * Enables @Async for non-blocking Redis event handling.
  */
 @Configuration
+@EnableAsync
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
 public class RedisConfig {
 
@@ -87,5 +93,24 @@ public class RedisConfig {
                 new ClassPathResource("lua/find_dispatch_frames.lua")));
         script.setResultType(List.class);
         return script;
+    }
+
+    /**
+     * Thread pool executor for async Redis event handling.
+     * This ensures Redis sync operations don't block the main dispatch thread.
+     */
+    @Bean(name = "redisAsyncExecutor")
+    public Executor redisAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(1000);
+        executor.setThreadNamePrefix("redis-sync-");
+        executor.setRejectedExecutionHandler((r, e) -> {
+            logger.warn("Redis sync task rejected - queue full, dropping event");
+        });
+        executor.initialize();
+        logger.info("Redis async executor initialized with {} core threads", executor.getCorePoolSize());
+        return executor;
     }
 }
