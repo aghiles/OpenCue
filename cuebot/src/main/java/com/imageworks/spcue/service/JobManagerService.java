@@ -63,6 +63,9 @@ import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.JobLogUtil;
 import com.imageworks.spcue.util.Convert;
+import com.imageworks.spcue.dao.redis.SchedulingEventPublisher;
+
+import org.springframework.beans.factory.annotation.Autowired;
 
 @Transactional
 public class JobManagerService implements JobManager {
@@ -80,6 +83,20 @@ public class JobManagerService implements JobManager {
     private GroupDao groupDao;
     private FacilityDao facilityDao;
     private JobLogUtil jobLogUtil;
+    private SchedulingEventPublisher schedulingEventPublisher;
+
+    /**
+     * Set the scheduling event publisher for Redis cache synchronization.
+     * Autowired with required=false so it works whether Redis is enabled or not.
+     */
+    @Autowired(required = false)
+    public void setSchedulingEventPublisher(SchedulingEventPublisher schedulingEventPublisher) {
+        this.schedulingEventPublisher = schedulingEventPublisher;
+        if (schedulingEventPublisher != null) {
+            logger.info("Scheduling event publisher configured in JobManagerService: {}",
+                    schedulingEventPublisher.getClass().getSimpleName());
+        }
+    }
 
     @Transactional(propagation = Propagation.REQUIRED, readOnly = true)
     public boolean isJobComplete(JobInterface job) {
@@ -163,6 +180,54 @@ public class JobManagerService implements JobManager {
     @Transactional(propagation = Propagation.REQUIRED)
     public void setJobPaused(JobInterface job, boolean paused) {
         jobDao.updatePaused(job, paused);
+        // Publish job state change for Redis cache sync
+        if (schedulingEventPublisher != null) {
+            try {
+                JobDetail jobDetail = jobDao.getJobDetail(job.getJobId());
+                GroupDetail group = groupDao.getGroupDetail(job);
+                publishJobStateChange(jobDetail, group);
+            } catch (Exception e) {
+                logger.warn("Failed to publish job pause state change for Redis: {}", job.getJobId(), e);
+            }
+        }
+    }
+
+    /**
+     * Helper method to publish job state changes to Redis.
+     * Uses data from JobDetail and GroupDetail to populate all required fields.
+     */
+    private void publishJobStateChange(JobDetail jobDetail, GroupDetail group) {
+        if (schedulingEventPublisher == null) {
+            return;
+        }
+
+        schedulingEventPublisher.publishJobStateChanged(
+                jobDetail.id,
+                jobDetail.showId,
+                jobDetail.facilityId,
+                jobDetail.groupId,
+                jobDetail.state,
+                jobDetail.isPaused,
+                null, // os - not stored in JobDetail, will use default
+                jobDetail.priority,
+                0, // current cores - starts at 0 for new jobs
+                jobDetail.minCoreUnits,
+                jobDetail.maxCoreUnits,
+                0, // current gpus - starts at 0 for new jobs
+                jobDetail.maxGpuUnits,
+                System.currentTimeMillis() / 1000, // tsUpdated
+                0, // folder current cores
+                group != null ? group.maxCores : -1,
+                0, // folder current gpus
+                group != null ? group.maxGpus : -1,
+                jobDetail.showName,
+                jobDetail.name,
+                jobDetail.shot,
+                jobDetail.user,
+                jobDetail.uid.orElse(null),
+                jobDetail.logDir,
+                jobDetail.logLokiURL
+        );
     }
 
     @Transactional(propagation = Propagation.REQUIRED)
@@ -194,6 +259,16 @@ public class JobManagerService implements JobManager {
 
         for (BuildableJob job : spec.getJobs()) {
             jobDao.activateJob(job.detail, JobState.PENDING);
+            // Update state to PENDING and publish to Redis
+            job.detail.state = JobState.PENDING;
+            if (schedulingEventPublisher != null) {
+                try {
+                    GroupDetail group = groupDao.getGroupDetail(job.detail);
+                    publishJobStateChange(job.detail, group);
+                } catch (Exception e) {
+                    logger.warn("Failed to publish job activation for Redis: {}", job.detail.id, e);
+                }
+            }
             if (job.getPostJob() != null) {
                 jobDao.activateJob(job.getPostJob().detail, JobState.POSTED);
             }
@@ -320,6 +395,15 @@ public class JobManagerService implements JobManager {
             logger.info("shutting down job: " + job.getName());
             jobDao.activatePostJob(job);
             logger.info("activating post jobs");
+            // Publish job completion for Redis cache cleanup
+            if (schedulingEventPublisher != null) {
+                try {
+                    schedulingEventPublisher.publishJobCompleted(
+                            job.getJobId(), job.getShowId(), job.getFacilityId());
+                } catch (Exception e) {
+                    logger.warn("Failed to publish job completion for Redis: {}", job.getJobId(), e);
+                }
+            }
             return true;
         }
         return false;
