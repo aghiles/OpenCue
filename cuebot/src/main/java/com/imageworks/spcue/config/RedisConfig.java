@@ -97,6 +97,19 @@ public class RedisConfig {
     }
 
     /**
+     * Lua script for finding dispatch frames by layer.
+     * Simpler version that checks a single layer instead of all job layers.
+     */
+    @Bean
+    public RedisScript<List> findDispatchFramesByLayerScript() {
+        DefaultRedisScript<List> script = new DefaultRedisScript<>();
+        script.setScriptSource(new ResourceScriptSource(
+                new ClassPathResource("lua/find_dispatch_frames_by_layer.lua")));
+        script.setResultType(List.class);
+        return script;
+    }
+
+    /**
      * Lua script for finding jobs by show.
      * Finds pending jobs with waiting frames ordered by calculated priority.
      */

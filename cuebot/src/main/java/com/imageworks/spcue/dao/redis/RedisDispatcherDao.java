@@ -31,6 +31,7 @@ import org.springframework.stereotype.Repository;
 import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
 import com.imageworks.spcue.JobInterface;
+import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.FrameDao;
 import com.imageworks.spcue.grpc.host.ThreadMode;
@@ -55,19 +56,23 @@ public class RedisDispatcherDao {
 
     private final RedisTemplate<String, String> redisTemplate;
     private final RedisScript<List> findDispatchFramesScript;
+    private final RedisScript<List> findDispatchFramesByLayerScript;
     private final FrameDao frameDao;
 
     // Redis key prefixes
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
+    private static final String FRAMES_WAITING_PREFIX = "frames:waiting:";
     private static final String FRAME_PREFIX = "frame:";
     private static final String LAYER_PREFIX = "layer:";
     private static final String JOB_PREFIX = "job:";
 
     public RedisDispatcherDao(RedisTemplate<String, String> redisTemplate,
                                RedisScript<List> findDispatchFramesScript,
+                               RedisScript<List> findDispatchFramesByLayerScript,
                                FrameDao frameDao) {
         this.redisTemplate = redisTemplate;
         this.findDispatchFramesScript = findDispatchFramesScript;
+        this.findDispatchFramesByLayerScript = findDispatchFramesByLayerScript;
         this.frameDao = frameDao;
         logger.info("Redis dispatcher DAO initialized (full Redis mode)");
     }
@@ -129,6 +134,65 @@ public class RedisDispatcherDao {
 
         } catch (Exception e) {
             logger.error("Redis frame search by proc failed", e);
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Find next dispatch frames for a specific layer using Redis.
+     * Simpler than job version - only checks one layer.
+     *
+     * @param layer The layer to find frames for
+     * @param host  The dispatch host with available resources
+     * @param limit Maximum number of frames to return
+     * @return List of DispatchFrame objects
+     */
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host, int limit) {
+        long startTime = System.currentTimeMillis();
+
+        try {
+            List<String> frameIds = executeFrameSearchByLayer(layer, host, limit);
+
+            if (frameIds == null || frameIds.isEmpty()) {
+                logger.debug("No eligible frames found in Redis for layer {}", layer.getLayerId());
+                return Collections.emptyList();
+            }
+
+            List<DispatchFrame> frames = buildDispatchFramesFromRedis(frameIds, layer.getJobId());
+
+            logger.debug("Redis findNextDispatchFrames (layer): found {} frames in {}ms (zero SQL)",
+                    frames.size(), System.currentTimeMillis() - startTime);
+
+            return frames;
+
+        } catch (Exception e) {
+            logger.error("Redis frame search by layer failed", e);
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Find next dispatch frames for a specific layer using a VirtualProc.
+     */
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc, int limit) {
+        long startTime = System.currentTimeMillis();
+
+        try {
+            List<String> frameIds = executeFrameSearchByLayerAndProc(layer, proc, limit);
+
+            if (frameIds == null || frameIds.isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            List<DispatchFrame> frames = buildDispatchFramesFromRedis(frameIds, layer.getJobId());
+
+            logger.debug("Redis findNextDispatchFrames (layer+proc): found {} frames in {}ms (zero SQL)",
+                    frames.size(), System.currentTimeMillis() - startTime);
+
+            return frames;
+
+        } catch (Exception e) {
+            logger.error("Redis frame search by layer and proc failed", e);
             return Collections.emptyList();
         }
     }
@@ -325,6 +389,50 @@ public class RedisDispatcherDao {
         return redisTemplate.execute(
                 findDispatchFramesScript,
                 Collections.singletonList(layersWaitingKey),
+                String.valueOf(proc.coresReserved),
+                String.valueOf(proc.memoryReserved),
+                String.valueOf(proc.gpusReserved),
+                String.valueOf(proc.gpuMemoryReserved),
+                proc.tags,
+                "1", // Proc dispatch doesn't check threadable
+                String.valueOf(limit)
+        );
+    }
+
+    /**
+     * Execute Lua script for layer-based frame search.
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> executeFrameSearchByLayer(LayerInterface layer, DispatchHost host, int limit) {
+        String layerKey = LAYER_PREFIX + layer.getLayerId();
+        String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
+
+        int threadMode = (host.threadMode == ThreadMode.ALL_VALUE) ? 1 : 0;
+
+        return redisTemplate.execute(
+                findDispatchFramesByLayerScript,
+                java.util.Arrays.asList(layerKey, framesWaitingKey),
+                String.valueOf(host.idleCores),
+                String.valueOf(host.idleMemory),
+                String.valueOf(host.idleGpus),
+                String.valueOf(host.idleGpuMemory),
+                host.tags,
+                String.valueOf(threadMode),
+                String.valueOf(limit)
+        );
+    }
+
+    /**
+     * Execute layer-based frame search using VirtualProc resources.
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> executeFrameSearchByLayerAndProc(LayerInterface layer, VirtualProc proc, int limit) {
+        String layerKey = LAYER_PREFIX + layer.getLayerId();
+        String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
+
+        return redisTemplate.execute(
+                findDispatchFramesByLayerScript,
+                java.util.Arrays.asList(layerKey, framesWaitingKey),
                 String.valueOf(proc.coresReserved),
                 String.valueOf(proc.memoryReserved),
                 String.valueOf(proc.gpusReserved),
