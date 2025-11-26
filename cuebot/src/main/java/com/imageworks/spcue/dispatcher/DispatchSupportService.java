@@ -154,6 +154,10 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findNextDispatchFrames(layer, host, limit);
+        }
         return dispatcherDao.findNextDispatchFrames(layer, host, limit);
     }
 
@@ -161,6 +165,10 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findNextDispatchFrames(layer, proc, limit);
+        }
         return dispatcherDao.findNextDispatchFrames(layer, proc, limit);
     }
 
@@ -186,6 +194,10 @@ public class DispatchSupportService implements DispatchSupport {
 
     @Transactional(readOnly = true)
     public Set<String> findDispatchJobs(DispatchHost host, GroupInterface g) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findDispatchJobs(host, g);
+        }
         return dispatcherDao.findDispatchJobs(host, g);
     }
 
@@ -198,6 +210,10 @@ public class DispatchSupportService implements DispatchSupport {
     @Override
     @Transactional(readOnly = true)
     public Set<String> findDispatchJobs(DispatchHost host, ShowInterface show, int numJobs) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findDispatchJobs(host, show, numJobs);
+        }
         return dispatcherDao.findDispatchJobs(host, show, numJobs);
     }
 

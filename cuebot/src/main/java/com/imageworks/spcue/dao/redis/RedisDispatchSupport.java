@@ -15,7 +15,9 @@
 
 package com.imageworks.spcue.dao.redis;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -25,7 +27,11 @@ import org.springframework.stereotype.Service;
 
 import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
+import com.imageworks.spcue.DispatchJob;
+import com.imageworks.spcue.GroupInterface;
 import com.imageworks.spcue.JobInterface;
+import com.imageworks.spcue.LayerInterface;
+import com.imageworks.spcue.ShowInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.DispatcherDao;
 
@@ -115,5 +121,94 @@ public class RedisDispatchSupport {
      */
     public boolean isRedisAvailableForJob(String jobId) {
         return redisDispatcherDao.hasJobData(jobId);
+    }
+
+    // ============================================================
+    // LAYER DISPATCH METHODS
+    // ============================================================
+
+    /**
+     * Find next dispatch frames for a specific layer using Redis with SQL fallback.
+     */
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host, int limit) {
+        long startTime = System.currentTimeMillis();
+
+        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, host, limit);
+
+        if (!frames.isEmpty()) {
+            logger.debug("Redis dispatch (layer): found {} frames in {}ms",
+                    frames.size(), System.currentTimeMillis() - startTime);
+            return frames;
+        }
+
+        // Fall back to SQL
+        return sqlDispatcherDao.findNextDispatchFrames(layer, host, limit);
+    }
+
+    /**
+     * Find next dispatch frames for a specific layer using VirtualProc.
+     */
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc, int limit) {
+        long startTime = System.currentTimeMillis();
+
+        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, proc, limit);
+
+        if (!frames.isEmpty()) {
+            logger.debug("Redis dispatch (layer+proc): found {} frames in {}ms",
+                    frames.size(), System.currentTimeMillis() - startTime);
+            return frames;
+        }
+
+        // Fall back to SQL
+        return sqlDispatcherDao.findNextDispatchFrames(layer, proc, limit);
+    }
+
+    // ============================================================
+    // JOB DISPATCH METHODS
+    // ============================================================
+
+    /**
+     * Find dispatch jobs for a show using Redis with SQL fallback.
+     * Returns job IDs for compatibility with existing code.
+     */
+    public Set<String> findDispatchJobs(DispatchHost host, ShowInterface show, int numJobs) {
+        long startTime = System.currentTimeMillis();
+
+        List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(show, host, numJobs);
+
+        if (!jobs.isEmpty()) {
+            Set<String> jobIds = new HashSet<>(jobs.size());
+            for (DispatchJob job : jobs) {
+                jobIds.add(job.id);
+            }
+            logger.debug("Redis dispatch (show): found {} jobs in {}ms",
+                    jobs.size(), System.currentTimeMillis() - startTime);
+            return jobIds;
+        }
+
+        // Fall back to SQL
+        return sqlDispatcherDao.findDispatchJobs(host, show, numJobs);
+    }
+
+    /**
+     * Find dispatch jobs for a group using Redis with SQL fallback.
+     */
+    public Set<String> findDispatchJobs(DispatchHost host, GroupInterface group) {
+        long startTime = System.currentTimeMillis();
+
+        List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(group, host, 50);
+
+        if (!jobs.isEmpty()) {
+            Set<String> jobIds = new HashSet<>(jobs.size());
+            for (DispatchJob job : jobs) {
+                jobIds.add(job.id);
+            }
+            logger.debug("Redis dispatch (group): found {} jobs in {}ms",
+                    jobs.size(), System.currentTimeMillis() - startTime);
+            return jobIds;
+        }
+
+        // Fall back to SQL
+        return sqlDispatcherDao.findDispatchJobs(host, group);
     }
 }
