@@ -24,4 +24,8 @@ public class DispatchJob extends JobEntity implements JobInterface {
     public boolean autoBook;
     public boolean autoUnbook;
     public JobState state;
+
+    // Fields used by Redis dispatch queries
+    public int priority;
+    public int rank;
 }

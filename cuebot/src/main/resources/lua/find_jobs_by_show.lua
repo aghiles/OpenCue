@@ -1,15 +1,20 @@
 --[[
   Find jobs by show for dispatch.
 
-  This Lua script mirrors the SQL query FIND_JOBS_BY_SHOW.
-  It finds pending jobs with waiting frames that match host resources,
-  ordered by calculated priority.
+  This Lua script mirrors the SQL queries:
+  - FIND_JOBS_BY_SHOW (BALANCED mode - default)
+  - FIND_JOBS_BY_SHOW_PRIORITY_MODE
+  - FIND_JOBS_BY_SHOW_FIFO_MODE
+  - FIND_JOBS_BY_SHOW_NO_GPU
+  - FIND_JOBS_BY_GROUP (and its variants)
 
-  Priority calculation:
-    priority + (100 * (1 - cores/min_cores)) + age_in_days
+  Priority calculation varies by mode:
+    BALANCED (0): priority + (100 * (1 - cores/min_cores)) + age_in_days
+    PRIORITY (1): priority only
+    FIFO (2):     priority, then oldest job first (by tsStarted)
 
   KEYS:
-    KEYS[1] = jobs:pending:{showId}:{facilityId} - Set of pending job IDs
+    KEYS[1] = jobs:pending:{showId}:{facilityId} OR jobs:pending:group:{groupId}
 
   ARGV:
     ARGV[1]  = hostCores      - Available cores on host
@@ -22,6 +27,8 @@
     ARGV[8]  = hostOs         - Comma-separated list of supported OS
     ARGV[9]  = currentTime    - Current timestamp in seconds
     ARGV[10] = limit          - Maximum number of jobs to return
+    ARGV[11] = sortMode       - 0 = BALANCED, 1 = PRIORITY, 2 = FIFO
+    ARGV[12] = noGpu          - 1 = skip GPU checks, 0 = normal
 
   Returns:
     List of {jobId, priority, rank} tables ordered by priority descending
@@ -38,6 +45,8 @@ local hostTags = ARGV[7]
 local hostOs = ARGV[8]
 local currentTime = tonumber(ARGV[9])
 local limit = tonumber(ARGV[10])
+local sortMode = tonumber(ARGV[11] or 0)
+local noGpu = tonumber(ARGV[12] or 0)
 
 -- Helper function to check if host tags match layer tags
 local function tagsMatch(hostTagStr, layerTagPattern)
@@ -78,7 +87,7 @@ local function osMatches(jobOs, hostOsList)
     return false
 end
 
--- Get all pending job IDs for this show/facility
+-- Get all pending job IDs for this show/facility or group
 local jobIds = redis.call('SMEMBERS', jobsPendingKey)
 
 if #jobIds == 0 then
@@ -148,19 +157,22 @@ for _, jobId in ipairs(jobIds) do
                             layerMatches = false
                         end
 
-                        -- Check GPUs (BETWEEN 1 AND hostGpus)
-                        if hostGpus > 0 then
-                            if minGpus < 1 or minGpus > hostGpus then
+                        -- GPU checks (skip if noGpu mode)
+                        if noGpu == 0 then
+                            -- Check GPUs (BETWEEN 1 AND hostGpus)
+                            if hostGpus > 0 then
+                                if minGpus < 1 or minGpus > hostGpus then
+                                    layerMatches = false
+                                end
+                            elseif minGpus > 0 then
                                 layerMatches = false
                             end
-                        elseif minGpus > 0 then
-                            layerMatches = false
-                        end
 
-                        -- Check GPU memory (BETWEEN minGpuMem AND maxGpuMem)
-                        if maxGpuMem > 0 then
-                            if layerGpuMem < minGpuMem or layerGpuMem > maxGpuMem then
-                                layerMatches = false
+                            -- Check GPU memory (BETWEEN minGpuMem AND maxGpuMem)
+                            if maxGpuMem > 0 then
+                                if layerGpuMem < minGpuMem or layerGpuMem > maxGpuMem then
+                                    layerMatches = false
+                                end
                             end
                         end
 
@@ -193,31 +205,39 @@ for _, jobId in ipairs(jobIds) do
                 end
 
                 if hasEligibleLayer then
-                    -- Calculate priority score
                     local basePriority = tonumber(job['priority'] or 0)
                     local jobCores = tonumber(job['cores'] or 0)
                     local minCores = tonumber(job['minCores'] or 0)
                     local tsUpdated = tonumber(job['tsUpdated'] or currentTime)
+                    local tsStarted = tonumber(job['tsStarted'] or currentTime)
 
-                    -- Under-proc bonus: 100 * (1 - cores/min_cores)
-                    local underProcBonus = 0
-                    if minCores > 0 then
-                        if jobCores < minCores then
-                            underProcBonus = 100 * (1 - jobCores / minCores)
+                    local calculatedPriority = basePriority
+
+                    if sortMode == 0 then
+                        -- BALANCED mode: priority + under-proc bonus + age
+                        local underProcBonus = 0
+                        if minCores > 0 then
+                            if jobCores < minCores then
+                                underProcBonus = 100 * (1 - jobCores / minCores)
+                            end
                         end
-                    end
 
-                    -- Age bonus: days since last update
-                    local ageInDays = math.floor((currentTime - tsUpdated) / 86400)
-                    if ageInDays < 0 then
-                        ageInDays = 0
-                    end
+                        local ageInDays = math.floor((currentTime - tsUpdated) / 86400)
+                        if ageInDays < 0 then
+                            ageInDays = 0
+                        end
 
-                    local calculatedPriority = math.floor(basePriority + underProcBonus + ageInDays)
+                        calculatedPriority = math.floor(basePriority + underProcBonus + ageInDays)
+                    elseif sortMode == 1 then
+                        -- PRIORITY mode: just priority
+                        calculatedPriority = basePriority
+                    end
+                    -- FIFO mode (2): priority is used, but we also track tsStarted
 
                     table.insert(eligibleJobs, {
                         jobId = jobId,
-                        priority = calculatedPriority
+                        priority = calculatedPriority,
+                        tsStarted = tsStarted
                     })
                 end
             end
@@ -225,10 +245,21 @@ for _, jobId in ipairs(jobIds) do
     end
 end
 
--- Sort by priority descending
-table.sort(eligibleJobs, function(a, b)
-    return a.priority > b.priority
-end)
+-- Sort based on mode
+if sortMode == 2 then
+    -- FIFO mode: sort by priority DESC, then tsStarted ASC (oldest first)
+    table.sort(eligibleJobs, function(a, b)
+        if a.priority ~= b.priority then
+            return a.priority > b.priority
+        end
+        return a.tsStarted < b.tsStarted
+    end)
+else
+    -- BALANCED and PRIORITY modes: sort by priority DESC
+    table.sort(eligibleJobs, function(a, b)
+        return a.priority > b.priority
+    end)
+end
 
 -- Build result with rank, limited to requested count
 local result = {}
