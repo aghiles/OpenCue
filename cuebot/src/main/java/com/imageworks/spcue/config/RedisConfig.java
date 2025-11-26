@@ -97,6 +97,19 @@ public class RedisConfig {
     }
 
     /**
+     * Lua script for finding jobs by show.
+     * Finds pending jobs with waiting frames ordered by calculated priority.
+     */
+    @Bean
+    public RedisScript<List> findJobsByShowScript() {
+        DefaultRedisScript<List> script = new DefaultRedisScript<>();
+        script.setScriptSource(new ResourceScriptSource(
+                new ClassPathResource("lua/find_jobs_by_show.lua")));
+        script.setResultType(List.class);
+        return script;
+    }
+
+    /**
      * Thread pool executor for async Redis event handling.
      * This ensures Redis sync operations don't block the main dispatch thread.
      */

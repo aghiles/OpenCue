@@ -22,8 +22,10 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 
 import com.imageworks.spcue.FrameInterface;
+import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.grpc.job.FrameState;
+import com.imageworks.spcue.grpc.job.JobState;
 
 /**
  * Redis-enabled implementation of SchedulingEventPublisher.
@@ -88,9 +90,29 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
     }
 
     @Override
-    public void publishJobCompleted(String jobId) {
+    public void publishJobCompleted(String jobId, String showId, String facilityId) {
         logger.debug("Publishing job completed: {}", jobId);
-        eventPublisher.publishEvent(new JobCompletedEvent(jobId));
+        eventPublisher.publishEvent(new JobCompletedEvent(jobId, showId, facilityId));
+    }
+
+    @Override
+    public void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
+                                        JobState state, boolean paused, String os,
+                                        int priority, int cores, int minCores, int maxCores,
+                                        int gpus, int maxGpus, long tsUpdated,
+                                        int folderCores, int folderMaxCores,
+                                        int folderGpus, int folderMaxGpus) {
+        logger.trace("Publishing job state change: {} state={} paused={}", jobId, state, paused);
+
+        JobStateChangedEvent event = new JobStateChangedEvent(
+                jobId, showId, facilityId, folderId,
+                state, paused, os,
+                priority, cores, minCores, maxCores,
+                gpus, maxGpus, tsUpdated,
+                folderCores, folderMaxCores, folderGpus, folderMaxGpus
+        );
+
+        eventPublisher.publishEvent(event);
     }
 
     /**
@@ -98,13 +120,25 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
      */
     public static class JobCompletedEvent {
         private final String jobId;
+        private final String showId;
+        private final String facilityId;
 
-        public JobCompletedEvent(String jobId) {
+        public JobCompletedEvent(String jobId, String showId, String facilityId) {
             this.jobId = jobId;
+            this.showId = showId;
+            this.facilityId = facilityId;
         }
 
         public String getJobId() {
             return jobId;
+        }
+
+        public String getShowId() {
+            return showId;
+        }
+
+        public String getFacilityId() {
+            return facilityId;
         }
     }
 }

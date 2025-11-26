@@ -21,6 +21,7 @@ import org.springframework.stereotype.Component;
 import com.imageworks.spcue.FrameInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.grpc.job.FrameState;
+import com.imageworks.spcue.grpc.job.JobState;
 
 /**
  * No-op implementation of SchedulingEventPublisher.
@@ -51,7 +52,17 @@ public class NoOpSchedulingEventPublisher implements SchedulingEventPublisher {
     }
 
     @Override
-    public void publishJobCompleted(String jobId) {
+    public void publishJobCompleted(String jobId, String showId, String facilityId) {
+        // No-op
+    }
+
+    @Override
+    public void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
+                                        JobState state, boolean paused, String os,
+                                        int priority, int cores, int minCores, int maxCores,
+                                        int gpus, int maxGpus, long tsUpdated,
+                                        int folderCores, int folderMaxCores,
+                                        int folderGpus, int folderMaxGpus) {
         // No-op
     }
 }

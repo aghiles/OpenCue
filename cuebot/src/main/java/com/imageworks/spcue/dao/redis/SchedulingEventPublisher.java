@@ -18,6 +18,7 @@ package com.imageworks.spcue.dao.redis;
 import com.imageworks.spcue.FrameInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.grpc.job.FrameState;
+import com.imageworks.spcue.grpc.job.JobState;
 
 /**
  * Interface for publishing scheduling-related events.
@@ -65,7 +66,38 @@ public interface SchedulingEventPublisher {
     /**
      * Notify that a job has completed and its cache data can be cleaned up.
      *
-     * @param jobId The job ID
+     * @param jobId      The job ID
+     * @param showId     The show ID
+     * @param facilityId The facility ID
      */
-    void publishJobCompleted(String jobId);
+    void publishJobCompleted(String jobId, String showId, String facilityId);
+
+    /**
+     * Publish a job state change event.
+     *
+     * @param jobId          Job ID
+     * @param showId         Show ID
+     * @param facilityId     Facility ID
+     * @param folderId       Folder ID
+     * @param state          Job state
+     * @param paused         Whether job is paused
+     * @param os             Job OS requirement
+     * @param priority       Job priority
+     * @param cores          Current cores allocated
+     * @param minCores       Minimum cores needed
+     * @param maxCores       Maximum cores allowed
+     * @param gpus           Current GPUs allocated
+     * @param maxGpus        Maximum GPUs allowed
+     * @param tsUpdated      Timestamp of last update
+     * @param folderCores    Folder's current cores
+     * @param folderMaxCores Folder's max cores
+     * @param folderGpus     Folder's current GPUs
+     * @param folderMaxGpus  Folder's max GPUs
+     */
+    void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
+                                 JobState state, boolean paused, String os,
+                                 int priority, int cores, int minCores, int maxCores,
+                                 int gpus, int maxGpus, long tsUpdated,
+                                 int folderCores, int folderMaxCores,
+                                 int folderGpus, int folderMaxGpus);
 }
