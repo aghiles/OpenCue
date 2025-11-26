@@ -51,6 +51,7 @@ import com.imageworks.spcue.dao.LayerDao;
 import com.imageworks.spcue.dao.ProcDao;
 import com.imageworks.spcue.dao.ShowDao;
 import com.imageworks.spcue.dao.SubscriptionDao;
+import com.imageworks.spcue.dao.redis.RedisDispatchSupport;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.CheckpointState;
 import com.imageworks.spcue.grpc.job.FrameState;
@@ -59,6 +60,8 @@ import com.imageworks.spcue.rqd.RqdClient;
 import com.imageworks.spcue.service.BookingManager;
 import com.imageworks.spcue.service.DependManager;
 import com.imageworks.spcue.util.FrameSet;
+
+import org.springframework.beans.factory.annotation.Autowired;
 
 @Transactional(propagation = Propagation.REQUIRED)
 public class DispatchSupportService implements DispatchSupport {
@@ -77,6 +80,21 @@ public class DispatchSupportService implements DispatchSupport {
     private RedirectManager redirectManager;
     private BookingManager bookingManager;
     private BookingDao bookingDao;
+
+    // Optional Redis dispatch support - null when Redis is disabled
+    private RedisDispatchSupport redisDispatchSupport;
+
+    /**
+     * Set the optional Redis dispatch support.
+     * When Redis is enabled, this provides faster frame lookups.
+     */
+    @Autowired(required = false)
+    public void setRedisDispatchSupport(RedisDispatchSupport redisDispatchSupport) {
+        this.redisDispatchSupport = redisDispatchSupport;
+        if (redisDispatchSupport != null) {
+            logger.info("Redis dispatch support enabled for faster frame lookups");
+        }
+    }
 
     private ConcurrentHashMap<String, StrandedCores> strandedCores =
             new ConcurrentHashMap<String, StrandedCores>();
@@ -115,12 +133,20 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, VirtualProc proc,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findNextDispatchFrames(job, proc, limit);
+        }
         return dispatcherDao.findNextDispatchFrames(job, proc, limit);
     }
 
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, DispatchHost host,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findNextDispatchFrames(job, host, limit);
+        }
         return dispatcherDao.findNextDispatchFrames(job, host, limit);
     }
 

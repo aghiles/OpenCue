@@ -157,6 +157,14 @@ public class RedisSchedulingEventListener {
     }
 
     /**
+     * Handle job completion - clean up Redis data.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onJobCompleted(RedisSchedulingEventPublisher.JobCompletedEvent event) {
+        cleanupJob(event.getJobId());
+    }
+
+    /**
      * Remove all Redis data for a job (called when job completes/deletes).
      */
     public void cleanupJob(String jobId) {
