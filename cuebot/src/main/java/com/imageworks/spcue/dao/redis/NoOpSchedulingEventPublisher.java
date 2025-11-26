@@ -42,7 +42,8 @@ public class NoOpSchedulingEventPublisher implements SchedulingEventPublisher {
     @Override
     public void publishFrameStateChanged(String frameId, String layerId, String jobId,
                                           FrameState previousState, FrameState newState,
-                                          int dispatchOrder, int layerOrder) {
+                                          int dispatchOrder, int layerOrder,
+                                          String frameName, int retries, int version) {
         // No-op
     }
 
@@ -62,7 +63,9 @@ public class NoOpSchedulingEventPublisher implements SchedulingEventPublisher {
                                         int priority, int cores, int minCores, int maxCores,
                                         int gpus, int maxGpus, long tsUpdated,
                                         int folderCores, int folderMaxCores,
-                                        int folderGpus, int folderMaxGpus) {
+                                        int folderGpus, int folderMaxGpus,
+                                        String showName, String jobName, String shot,
+                                        String owner, Integer uid, String logDir, String lokiURL) {
         // No-op
     }
 }

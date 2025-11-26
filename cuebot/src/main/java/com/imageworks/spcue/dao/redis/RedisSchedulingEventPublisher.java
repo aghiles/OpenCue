@@ -52,30 +52,32 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
     @Override
     public void publishFrameStateChanged(FrameInterface frame, FrameState previousState,
                                           FrameState newState) {
-        // For basic frame interface, we don't have dispatch order info
-        // Use 0 as default - the initializer will set correct values
+        // For basic frame interface, we don't have full info
+        // Use defaults - the initializer will set correct values
         publishFrameStateChanged(
                 frame.getFrameId(),
                 frame.getLayerId(),
                 frame.getJobId(),
                 previousState,
                 newState,
-                0,
-                0
+                0, 0,
+                "", 0, 0
         );
     }
 
     @Override
     public void publishFrameStateChanged(String frameId, String layerId, String jobId,
                                           FrameState previousState, FrameState newState,
-                                          int dispatchOrder, int layerOrder) {
+                                          int dispatchOrder, int layerOrder,
+                                          String frameName, int retries, int version) {
         logger.trace("Publishing frame state change: {} {} -> {}",
                 frameId, previousState, newState);
 
         FrameStateChangedEvent event = new FrameStateChangedEvent(
                 frameId, layerId, jobId,
                 previousState, newState,
-                dispatchOrder, layerOrder
+                dispatchOrder, layerOrder,
+                frameName, retries, version
         );
 
         eventPublisher.publishEvent(event);
@@ -101,7 +103,9 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
                                         int priority, int cores, int minCores, int maxCores,
                                         int gpus, int maxGpus, long tsUpdated,
                                         int folderCores, int folderMaxCores,
-                                        int folderGpus, int folderMaxGpus) {
+                                        int folderGpus, int folderMaxGpus,
+                                        String showName, String jobName, String shot,
+                                        String owner, Integer uid, String logDir, String lokiURL) {
         logger.trace("Publishing job state change: {} state={} paused={}", jobId, state, paused);
 
         JobStateChangedEvent event = new JobStateChangedEvent(
@@ -109,7 +113,8 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
                 state, paused, os,
                 priority, cores, minCores, maxCores,
                 gpus, maxGpus, tsUpdated,
-                folderCores, folderMaxCores, folderGpus, folderMaxGpus
+                folderCores, folderMaxCores, folderGpus, folderMaxGpus,
+                showName, jobName, shot, owner, uid, logDir, lokiURL
         );
 
         eventPublisher.publishEvent(event);

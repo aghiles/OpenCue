@@ -168,6 +168,10 @@ public class RedisSchedulingEventListener {
         frameData.put("state", event.getNewState().toString());
         frameData.put("dispatchOrder", String.valueOf(event.getDispatchOrder()));
         frameData.put("layerOrder", String.valueOf(event.getLayerOrder()));
+        // Additional DispatchFrame fields
+        frameData.put("name", event.getFrameName() != null ? event.getFrameName() : "");
+        frameData.put("retries", String.valueOf(event.getRetries()));
+        frameData.put("version", String.valueOf(event.getVersion()));
 
         redisTemplate.opsForHash().putAll(frameKey, frameData);
     }
@@ -194,7 +198,7 @@ public class RedisSchedulingEventListener {
                 // Job is dispatchable - add to pending jobs set and update metadata
                 redisTemplate.opsForSet().add(pendingJobsKey, jobId);
 
-                // Update job metadata hash
+                // Update job metadata hash with ALL DispatchFrame fields
                 Map<String, String> jobData = new HashMap<>();
                 jobData.put("showId", showId);
                 jobData.put("facilityId", facilityId);
@@ -213,6 +217,14 @@ public class RedisSchedulingEventListener {
                 jobData.put("folderMaxCores", String.valueOf(event.getFolderMaxCores()));
                 jobData.put("folderGpus", String.valueOf(event.getFolderGpus()));
                 jobData.put("folderMaxGpus", String.valueOf(event.getFolderMaxGpus()));
+                // DispatchFrame fields
+                jobData.put("showName", event.getShowName() != null ? event.getShowName() : "");
+                jobData.put("jobName", event.getJobName() != null ? event.getJobName() : "");
+                jobData.put("shot", event.getShot() != null ? event.getShot() : "");
+                jobData.put("owner", event.getOwner() != null ? event.getOwner() : "");
+                jobData.put("uid", event.getUid() != null ? String.valueOf(event.getUid()) : "");
+                jobData.put("logDir", event.getLogDir() != null ? event.getLogDir() : "");
+                jobData.put("lokiURL", event.getLokiURL() != null ? event.getLokiURL() : "");
 
                 redisTemplate.opsForHash().putAll(jobKey, jobData);
 

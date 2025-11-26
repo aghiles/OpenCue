@@ -18,6 +18,8 @@ package com.imageworks.spcue.dao.redis;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -32,22 +34,18 @@ import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.FrameDao;
 import com.imageworks.spcue.grpc.host.ThreadMode;
+import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
  * Redis-based dispatcher DAO for fast frame lookups.
  *
- * This is a supplementary DAO that uses Redis for the expensive filtering
- * operations (finding eligible frames), then delegates to the SQL DAO
- * for fetching full frame details.
+ * Builds DispatchFrame objects entirely from Redis hashes for ZERO SQL on hot path.
+ * Falls back to SQL only if Redis data is missing (cache miss).
  *
- * Usage pattern:
- * 1. Use Lua script to find eligible frame IDs in Redis (O(n) with small n)
- * 2. Fetch full DispatchFrame objects from SQL using the IDs
- *
- * This hybrid approach gives us:
- * - Speed: Redis filtering is much faster than SQL JOINs
- * - Consistency: SQL remains source of truth for frame details
- * - Simplicity: No need to sync all frame details to Redis
+ * Redis data structures used:
+ * - frame:{frameId} - Frame metadata hash
+ * - layer:{layerId} - Layer metadata hash
+ * - job:{jobId} - Job metadata hash
  */
 @Repository
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -59,7 +57,11 @@ public class RedisDispatcherDao {
     private final RedisScript<List> findDispatchFramesScript;
     private final FrameDao frameDao;
 
+    // Redis key prefixes
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
+    private static final String FRAME_PREFIX = "frame:";
+    private static final String LAYER_PREFIX = "layer:";
+    private static final String JOB_PREFIX = "job:";
 
     public RedisDispatcherDao(RedisTemplate<String, String> redisTemplate,
                                RedisScript<List> findDispatchFramesScript,
@@ -67,13 +69,12 @@ public class RedisDispatcherDao {
         this.redisTemplate = redisTemplate;
         this.findDispatchFramesScript = findDispatchFramesScript;
         this.frameDao = frameDao;
-        logger.info("Redis dispatcher DAO initialized");
+        logger.info("Redis dispatcher DAO initialized (full Redis mode)");
     }
 
     /**
      * Find next dispatch frames for a job using Redis.
-     *
-     * This mirrors DispatcherDaoJdbc.findNextDispatchFrames(JobInterface, DispatchHost, int)
+     * Builds DispatchFrame entirely from Redis - zero SQL on hot path.
      *
      * @param job   The job to find frames for
      * @param host  The dispatch host with available resources
@@ -92,21 +93,10 @@ public class RedisDispatcherDao {
                 return Collections.emptyList();
             }
 
-            // Fetch full DispatchFrame objects from SQL
-            List<DispatchFrame> frames = new ArrayList<>(frameIds.size());
-            for (String frameId : frameIds) {
-                try {
-                    DispatchFrame frame = frameDao.getDispatchFrame(frameId);
-                    if (frame != null) {
-                        frames.add(frame);
-                    }
-                } catch (Exception e) {
-                    // Frame may have been dispatched between Redis lookup and SQL fetch
-                    logger.debug("Frame {} no longer available: {}", frameId, e.getMessage());
-                }
-            }
+            // Build DispatchFrame objects from Redis hashes
+            List<DispatchFrame> frames = buildDispatchFramesFromRedis(frameIds, job.getJobId());
 
-            logger.debug("Redis findNextDispatchFrames: found {} frames in {}ms",
+            logger.debug("Redis findNextDispatchFrames: found {} frames in {}ms (zero SQL)",
                     frames.size(), System.currentTimeMillis() - startTime);
 
             return frames;
@@ -130,19 +120,9 @@ public class RedisDispatcherDao {
                 return Collections.emptyList();
             }
 
-            List<DispatchFrame> frames = new ArrayList<>(frameIds.size());
-            for (String frameId : frameIds) {
-                try {
-                    DispatchFrame frame = frameDao.getDispatchFrame(frameId);
-                    if (frame != null) {
-                        frames.add(frame);
-                    }
-                } catch (Exception e) {
-                    logger.debug("Frame {} no longer available: {}", frameId, e.getMessage());
-                }
-            }
+            List<DispatchFrame> frames = buildDispatchFramesFromRedis(frameIds, job.getJobId());
 
-            logger.debug("Redis findNextDispatchFrames (proc): found {} frames in {}ms",
+            logger.debug("Redis findNextDispatchFrames (proc): found {} frames in {}ms (zero SQL)",
                     frames.size(), System.currentTimeMillis() - startTime);
 
             return frames;
@@ -150,6 +130,163 @@ public class RedisDispatcherDao {
         } catch (Exception e) {
             logger.error("Redis frame search by proc failed", e);
             return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Build DispatchFrame objects from Redis hashes.
+     * Falls back to SQL for individual frames if Redis data is missing.
+     */
+    private List<DispatchFrame> buildDispatchFramesFromRedis(List<String> frameIds, String jobId) {
+        List<DispatchFrame> frames = new ArrayList<>(frameIds.size());
+
+        // Get job data once (shared across all frames)
+        Map<Object, Object> jobData = redisTemplate.opsForHash().entries(JOB_PREFIX + jobId);
+
+        for (String frameId : frameIds) {
+            try {
+                DispatchFrame frame = buildDispatchFrameFromRedis(frameId, jobData);
+                if (frame != null) {
+                    frames.add(frame);
+                }
+            } catch (Exception e) {
+                logger.debug("Failed to build frame {} from Redis, trying SQL fallback: {}",
+                        frameId, e.getMessage());
+                // SQL fallback for cache miss
+                try {
+                    DispatchFrame frame = frameDao.getDispatchFrame(frameId);
+                    if (frame != null) {
+                        frames.add(frame);
+                    }
+                } catch (Exception sqlEx) {
+                    logger.debug("SQL fallback also failed for frame {}: {}", frameId, sqlEx.getMessage());
+                }
+            }
+        }
+
+        return frames;
+    }
+
+    /**
+     * Build a single DispatchFrame from Redis hashes.
+     * Returns null if essential data is missing.
+     */
+    private DispatchFrame buildDispatchFrameFromRedis(String frameId, Map<Object, Object> jobData) {
+        // Get frame data
+        Map<Object, Object> frameData = redisTemplate.opsForHash().entries(FRAME_PREFIX + frameId);
+        if (frameData == null || frameData.isEmpty()) {
+            throw new RuntimeException("Frame data not found in Redis: " + frameId);
+        }
+
+        String layerId = getString(frameData, "layerId");
+        if (layerId == null) {
+            throw new RuntimeException("Layer ID not found in frame data: " + frameId);
+        }
+
+        // Get layer data
+        Map<Object, Object> layerData = redisTemplate.opsForHash().entries(LAYER_PREFIX + layerId);
+        if (layerData == null || layerData.isEmpty()) {
+            throw new RuntimeException("Layer data not found in Redis: " + layerId);
+        }
+
+        // Build DispatchFrame
+        DispatchFrame frame = new DispatchFrame();
+
+        // Frame fields
+        frame.id = frameId;
+        frame.layerId = layerId;
+        frame.jobId = getString(frameData, "jobId");
+        frame.name = getString(frameData, "name");
+        frame.retries = getInt(frameData, "retries", 0);
+        frame.state = FrameState.valueOf(getString(frameData, "state", "WAITING"));
+
+        // Layer fields
+        frame.layerName = getString(layerData, "name");
+        frame.command = getString(layerData, "command");
+        frame.range = getString(layerData, "range");
+        frame.chunkSize = getInt(layerData, "chunkSize", 1);
+        frame.services = getString(layerData, "services");
+        frame.minCores = getInt(layerData, "minCores", 100);
+        frame.maxCores = getInt(layerData, "maxCores", 0);
+        frame.threadable = getBoolean(layerData, "threadable", false);
+        frame.minGpus = getInt(layerData, "minGpus", 0);
+        frame.maxGpus = getInt(layerData, "maxGpus", 0);
+        frame.minGpuMemory = getLong(layerData, "minGpuMemory", 0);
+        frame.setMinMemory(getLong(layerData, "minMemory", 0));
+
+        // Job fields
+        frame.show = getString(jobData, "showName");
+        frame.shot = getString(jobData, "shot");
+        frame.owner = getString(jobData, "owner");
+        frame.uid = getOptionalInt(jobData, "uid");
+        frame.logDir = getString(jobData, "logDir");
+        frame.jobName = getString(jobData, "jobName");
+        frame.os = getString(jobData, "os");
+        frame.lokiURL = getString(jobData, "lokiURL");
+
+        // Set IDs from job data if not in frame
+        if (frame.showId == null) {
+            frame.showId = getString(jobData, "showId");
+        }
+        if (frame.facilityId == null) {
+            frame.facilityId = getString(jobData, "facilityId");
+        }
+
+        return frame;
+    }
+
+    // Helper methods for safe type conversion
+    private String getString(Map<Object, Object> map, String key) {
+        Object value = map.get(key);
+        return value != null ? value.toString() : "";
+    }
+
+    private String getString(Map<Object, Object> map, String key, String defaultValue) {
+        Object value = map.get(key);
+        return value != null && !value.toString().isEmpty() ? value.toString() : defaultValue;
+    }
+
+    private int getInt(Map<Object, Object> map, String key, int defaultValue) {
+        Object value = map.get(key);
+        if (value == null || value.toString().isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value.toString());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private long getLong(Map<Object, Object> map, String key, long defaultValue) {
+        Object value = map.get(key);
+        if (value == null || value.toString().isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value.toString());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private boolean getBoolean(Map<Object, Object> map, String key, boolean defaultValue) {
+        Object value = map.get(key);
+        if (value == null || value.toString().isEmpty()) {
+            return defaultValue;
+        }
+        return Boolean.parseBoolean(value.toString());
+    }
+
+    private Optional<Integer> getOptionalInt(Map<Object, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null || value.toString().isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(Integer.parseInt(value.toString()));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
         }
     }
 

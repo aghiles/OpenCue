@@ -42,13 +42,23 @@ public class JobStateChangedEvent {
     private final int folderMaxCores;
     private final int folderGpus;
     private final int folderMaxGpus;
+    // DispatchFrame fields
+    private final String showName;
+    private final String jobName;
+    private final String shot;
+    private final String owner;
+    private final Integer uid;
+    private final String logDir;
+    private final String lokiURL;
 
     public JobStateChangedEvent(String jobId, String showId, String facilityId, String folderId,
                                  JobState state, boolean paused, String os,
                                  int priority, int cores, int minCores, int maxCores,
                                  int gpus, int maxGpus, long tsUpdated,
                                  int folderCores, int folderMaxCores,
-                                 int folderGpus, int folderMaxGpus) {
+                                 int folderGpus, int folderMaxGpus,
+                                 String showName, String jobName, String shot,
+                                 String owner, Integer uid, String logDir, String lokiURL) {
         this.jobId = jobId;
         this.showId = showId;
         this.facilityId = facilityId;
@@ -67,6 +77,13 @@ public class JobStateChangedEvent {
         this.folderMaxCores = folderMaxCores;
         this.folderGpus = folderGpus;
         this.folderMaxGpus = folderMaxGpus;
+        this.showName = showName;
+        this.jobName = jobName;
+        this.shot = shot;
+        this.owner = owner;
+        this.uid = uid;
+        this.logDir = logDir;
+        this.lokiURL = lokiURL;
     }
 
     public String getJobId() {
@@ -139,6 +156,34 @@ public class JobStateChangedEvent {
 
     public int getFolderMaxGpus() {
         return folderMaxGpus;
+    }
+
+    public String getShowName() {
+        return showName;
+    }
+
+    public String getJobName() {
+        return jobName;
+    }
+
+    public String getShot() {
+        return shot;
+    }
+
+    public String getOwner() {
+        return owner;
+    }
+
+    public Integer getUid() {
+        return uid;
+    }
+
+    public String getLogDir() {
+        return logDir;
+    }
+
+    public String getLokiURL() {
+        return lokiURL;
     }
 
     /**

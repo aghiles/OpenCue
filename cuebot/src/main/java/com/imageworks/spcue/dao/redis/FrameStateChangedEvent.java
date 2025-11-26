@@ -30,10 +30,15 @@ public class FrameStateChangedEvent {
     private final FrameState newState;
     private final int dispatchOrder;
     private final int layerOrder;
+    // Additional DispatchFrame fields
+    private final String frameName;
+    private final int retries;
+    private final int version;
 
     public FrameStateChangedEvent(String frameId, String layerId, String jobId,
                                    FrameState previousState, FrameState newState,
-                                   int dispatchOrder, int layerOrder) {
+                                   int dispatchOrder, int layerOrder,
+                                   String frameName, int retries, int version) {
         this.frameId = frameId;
         this.layerId = layerId;
         this.jobId = jobId;
@@ -41,6 +46,9 @@ public class FrameStateChangedEvent {
         this.newState = newState;
         this.dispatchOrder = dispatchOrder;
         this.layerOrder = layerOrder;
+        this.frameName = frameName;
+        this.retries = retries;
+        this.version = version;
     }
 
     public String getFrameId() {
@@ -69,6 +77,18 @@ public class FrameStateChangedEvent {
 
     public int getLayerOrder() {
         return layerOrder;
+    }
+
+    public String getFrameName() {
+        return frameName;
+    }
+
+    public int getRetries() {
+        return retries;
+    }
+
+    public int getVersion() {
+        return version;
     }
 
     /**

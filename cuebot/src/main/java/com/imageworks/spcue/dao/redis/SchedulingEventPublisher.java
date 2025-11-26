@@ -42,7 +42,7 @@ public interface SchedulingEventPublisher {
     void publishFrameStateChanged(FrameInterface frame, FrameState previousState, FrameState newState);
 
     /**
-     * Publish a frame state change with dispatch order info.
+     * Publish a frame state change with all DispatchFrame info.
      *
      * @param frameId        Frame ID
      * @param layerId        Layer ID
@@ -51,10 +51,14 @@ public interface SchedulingEventPublisher {
      * @param newState       New state
      * @param dispatchOrder  Frame dispatch order
      * @param layerOrder     Layer order
+     * @param frameName      Frame name
+     * @param retries        Number of retries
+     * @param version        Frame version
      */
     void publishFrameStateChanged(String frameId, String layerId, String jobId,
                                    FrameState previousState, FrameState newState,
-                                   int dispatchOrder, int layerOrder);
+                                   int dispatchOrder, int layerOrder,
+                                   String frameName, int retries, int version);
 
     /**
      * Publish a layer update event.
@@ -73,7 +77,7 @@ public interface SchedulingEventPublisher {
     void publishJobCompleted(String jobId, String showId, String facilityId);
 
     /**
-     * Publish a job state change event.
+     * Publish a job state change event with all DispatchFrame fields.
      *
      * @param jobId          Job ID
      * @param showId         Show ID
@@ -93,11 +97,20 @@ public interface SchedulingEventPublisher {
      * @param folderMaxCores Folder's max cores
      * @param folderGpus     Folder's current GPUs
      * @param folderMaxGpus  Folder's max GPUs
+     * @param showName       Show name for DispatchFrame
+     * @param jobName        Job name for DispatchFrame
+     * @param shot           Shot name
+     * @param owner          Job owner
+     * @param uid            User ID
+     * @param logDir         Log directory
+     * @param lokiURL        Loki URL for logging
      */
     void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
                                  JobState state, boolean paused, String os,
                                  int priority, int cores, int minCores, int maxCores,
                                  int gpus, int maxGpus, long tsUpdated,
                                  int folderCores, int folderMaxCores,
-                                 int folderGpus, int folderMaxGpus);
+                                 int folderGpus, int folderMaxGpus,
+                                 String showName, String jobName, String shot,
+                                 String owner, Integer uid, String logDir, String lokiURL);
 }
