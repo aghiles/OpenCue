@@ -15,6 +15,10 @@
 
 package com.imageworks.spcue.dao.redis;
 
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
 /**
  * Event published when a layer is created or updated.
  * Used to sync layer resource requirements to Redis.
@@ -37,12 +41,25 @@ public class LayerUpdatedEvent {
     private final String range;
     private final int chunkSize;
     private final String services;
+    // Layer limits: map of limitId -> maxValue
+    private final Map<String, Integer> limits;
 
     public LayerUpdatedEvent(String layerId, String jobId, String layerName, String layerType,
                               int minCores, int maxCores, long minMemory,
                               int minGpus, int maxGpus, long minGpuMemory,
                               boolean threadable, String tags, String command,
                               String range, int chunkSize, String services) {
+        this(layerId, jobId, layerName, layerType, minCores, maxCores, minMemory,
+             minGpus, maxGpus, minGpuMemory, threadable, tags, command, range, chunkSize, services,
+             Collections.emptyMap());
+    }
+
+    public LayerUpdatedEvent(String layerId, String jobId, String layerName, String layerType,
+                              int minCores, int maxCores, long minMemory,
+                              int minGpus, int maxGpus, long minGpuMemory,
+                              boolean threadable, String tags, String command,
+                              String range, int chunkSize, String services,
+                              Map<String, Integer> limits) {
         this.layerId = layerId;
         this.jobId = jobId;
         this.layerName = layerName;
@@ -59,6 +76,7 @@ public class LayerUpdatedEvent {
         this.range = range;
         this.chunkSize = chunkSize;
         this.services = services;
+        this.limits = limits != null ? limits : Collections.emptyMap();
     }
 
     public String getLayerId() {
@@ -123,5 +141,20 @@ public class LayerUpdatedEvent {
 
     public String getServices() {
         return services;
+    }
+
+    /**
+     * Get the limits that apply to this layer.
+     * @return Map of limitId -> maxValue
+     */
+    public Map<String, Integer> getLimits() {
+        return limits;
+    }
+
+    /**
+     * Check if this layer has any limits.
+     */
+    public boolean hasLimits() {
+        return limits != null && !limits.isEmpty();
     }
 }

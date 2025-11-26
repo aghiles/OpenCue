@@ -75,6 +75,7 @@ public class RedisDispatcherDao {
     private static final String JOB_PREFIX = "job:";
     private static final String JOBS_PENDING_PREFIX = "jobs:pending:";
     private static final String JOBS_PENDING_GROUP_PREFIX = "jobs:pending:group:";
+    private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
     // Sort modes for job queries
     public static final int SORT_MODE_BALANCED = 0;
@@ -576,11 +577,12 @@ public class RedisDispatcherDao {
     private List<String> executeFrameSearchByLayer(LayerInterface layer, DispatchHost host, int limit, boolean noGpu) {
         String layerKey = LAYER_PREFIX + layer.getLayerId();
         String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
+        String layerLimitsKey = LAYER_LIMITS_PREFIX + layer.getLayerId();
         int threadMode = (host.threadMode == ThreadMode.ALL_VALUE) ? 1 : 0;
 
         return redisTemplate.execute(
                 findDispatchFramesByLayerScript,
-                java.util.Arrays.asList(layerKey, framesWaitingKey),
+                java.util.Arrays.asList(layerKey, framesWaitingKey, layerLimitsKey),
                 String.valueOf(host.idleCores),
                 String.valueOf(host.idleMemory),
                 String.valueOf(host.idleGpus),
@@ -596,10 +598,11 @@ public class RedisDispatcherDao {
     private List<String> executeFrameSearchByLayerAndProc(LayerInterface layer, VirtualProc proc, int limit, boolean noGpu) {
         String layerKey = LAYER_PREFIX + layer.getLayerId();
         String framesWaitingKey = FRAMES_WAITING_PREFIX + layer.getLayerId();
+        String layerLimitsKey = LAYER_LIMITS_PREFIX + layer.getLayerId();
 
         return redisTemplate.execute(
                 findDispatchFramesByLayerScript,
-                java.util.Arrays.asList(layerKey, framesWaitingKey),
+                java.util.Arrays.asList(layerKey, framesWaitingKey, layerLimitsKey),
                 String.valueOf(proc.coresReserved),
                 String.valueOf(proc.memoryReserved),
                 String.valueOf(proc.gpusReserved),

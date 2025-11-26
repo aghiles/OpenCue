@@ -7,6 +7,7 @@
   KEYS:
     KEYS[1] = layer:{layerId} - Layer metadata hash
     KEYS[2] = frames:waiting:{layerId} - Sorted set of waiting frame IDs
+    KEYS[3] = layer:limits:{layerId} - Set of limit IDs for this layer
 
   ARGV:
     ARGV[1] = hostCores     - Available cores on host
@@ -24,6 +25,7 @@
 
 local layerKey = KEYS[1]
 local framesWaitingKey = KEYS[2]
+local layerLimitsKey = KEYS[3]
 local hostCores = tonumber(ARGV[1])
 local hostMemory = tonumber(ARGV[2])
 local hostGpus = tonumber(ARGV[3])
@@ -33,7 +35,9 @@ local threadMode = tonumber(ARGV[6])
 local limit = tonumber(ARGV[7])
 local noGpu = tonumber(ARGV[8] or 0)
 
--- Helper function to check if host tags match layer tags
+-- Helper function to check if host tags match layer tags using word boundaries
+-- SQL: host.str_tags ~* ('(?x)' || layer.str_tags || '\y')
+-- This matches whole words, not substrings
 local function tagsMatch(hostTagStr, layerTagPattern)
     if layerTagPattern == nil or layerTagPattern == '' then
         return true
@@ -45,12 +49,47 @@ local function tagsMatch(hostTagStr, layerTagPattern)
     -- Split pattern by | (OR in regex)
     for pattern in string.gmatch(patternLower, "[^|]+") do
         pattern = pattern:gsub("^%s*(.-)%s*$", "%1") -- trim
-        if string.find(hostTagsLower, pattern, 1, true) then
+
+        -- Word boundary matching: check if pattern appears as a whole word
+        local wordPattern = "%f[%w]" .. pattern:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1") .. "%f[%W]"
+        if string.find(hostTagsLower, wordPattern) then
             return true
+        end
+
+        -- Also check exact match for simple cases
+        for tag in string.gmatch(hostTagsLower, "[%w_]+") do
+            if tag == pattern then
+                return true
+            end
         end
     end
 
     return false
+end
+
+-- Helper function to check if layer limits allow dispatch
+-- Returns true if all limits have capacity, false if any limit is maxed out
+local function checkLayerLimits()
+    local limitIds = redis.call('SMEMBERS', layerLimitsKey)
+
+    if #limitIds == 0 then
+        return true -- No limits = always allowed
+    end
+
+    for _, limitId in ipairs(limitIds) do
+        local limitKey = 'limit:' .. limitId
+        local runningKey = 'limit:' .. limitId .. ':running'
+
+        local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
+        local running = tonumber(redis.call('GET', runningKey) or 0)
+
+        if maxValue > 0 and running >= maxValue then
+            -- Limit is maxed out - cannot dispatch to this layer
+            return false
+        end
+    end
+
+    return true -- All limits have capacity
 end
 
 -- Get layer data
@@ -108,8 +147,13 @@ if threadMode == 0 and not threadable then
     resourcesMatch = false
 end
 
--- Check tags
+-- Check tags (with word boundary matching)
 if resourcesMatch and not tagsMatch(hostTags, layerTags) then
+    resourcesMatch = false
+end
+
+-- Check layer limits - CRITICAL for 1-to-1 SQL parity
+if resourcesMatch and not checkLayerLimits() then
     resourcesMatch = false
 end
 

@@ -29,6 +29,7 @@ import com.imageworks.spcue.grpc.job.JobState;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Listens for entity change events and syncs them to Redis.
@@ -60,6 +61,8 @@ public class RedisSchedulingEventListener {
     private static final String JOB_PREFIX = "job:";
     private static final String JOB_LAYERS_WAITING_PREFIX = "job:layers:waiting:";
     private static final String JOBS_PENDING_PREFIX = "jobs:pending:";
+    private static final String LIMIT_PREFIX = "limit:";
+    private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
     public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -70,6 +73,8 @@ public class RedisSchedulingEventListener {
      * Handle frame state changes.
      * - When frame becomes WAITING: add to waiting sorted set
      * - When frame leaves WAITING: remove from waiting sorted set
+     * - When frame becomes RUNNING: increment limit counters
+     * - When frame leaves RUNNING: decrement limit counters
      */
     @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
@@ -108,6 +113,9 @@ public class RedisSchedulingEventListener {
                 logger.debug("Removed frame {} from waiting set {}", frameId, waitingSetKey);
             }
 
+            // Track limit running counts - CRITICAL for 1-to-1 parity with SQL
+            updateLimitCounters(layerId, previousState, newState);
+
             // Update frame metadata hash
             updateFrameMetadata(event);
 
@@ -118,7 +126,49 @@ public class RedisSchedulingEventListener {
     }
 
     /**
-     * Handle layer updates - store layer resource requirements.
+     * Update limit running counters when frames start/stop running.
+     * This is CRITICAL for 1-to-1 parity with SQL scheduling.
+     *
+     * SQL calculates: SUM(layer_stat.int_running_count) for all layers sharing a limit
+     * Redis tracks: limit:{limitId}:running counter (incremented/decremented atomically)
+     */
+    private void updateLimitCounters(String layerId, FrameState previousState, FrameState newState) {
+        // Get limits for this layer
+        String layerLimitsKey = LAYER_LIMITS_PREFIX + layerId;
+        Set<String> limitIds = redisTemplate.opsForSet().members(layerLimitsKey);
+
+        if (limitIds == null || limitIds.isEmpty()) {
+            return; // No limits for this layer
+        }
+
+        boolean wasRunning = (previousState == FrameState.RUNNING);
+        boolean isRunning = (newState == FrameState.RUNNING);
+
+        if (!wasRunning && isRunning) {
+            // Frame started running - increment all limit counters
+            for (String limitId : limitIds) {
+                String runningKey = LIMIT_PREFIX + limitId + ":running";
+                Long newCount = redisTemplate.opsForValue().increment(runningKey);
+                logger.debug("Limit {} running count incremented to {}", limitId, newCount);
+            }
+        } else if (wasRunning && !isRunning) {
+            // Frame stopped running - decrement all limit counters
+            for (String limitId : limitIds) {
+                String runningKey = LIMIT_PREFIX + limitId + ":running";
+                Long newCount = redisTemplate.opsForValue().decrement(runningKey);
+                // Ensure we don't go negative (safety check)
+                if (newCount != null && newCount < 0) {
+                    redisTemplate.opsForValue().set(runningKey, "0");
+                    logger.warn("Limit {} running count went negative, reset to 0", limitId);
+                } else {
+                    logger.debug("Limit {} running count decremented to {}", limitId, newCount);
+                }
+            }
+        }
+    }
+
+    /**
+     * Handle layer updates - store layer resource requirements and limits.
      */
     @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
@@ -149,10 +199,48 @@ public class RedisSchedulingEventListener {
 
             redisTemplate.opsForHash().putAll(layerKey, layerData);
 
+            // Store layer limits - CRITICAL for 1-to-1 parity with SQL
+            if (event.hasLimits()) {
+                updateLayerLimits(layerId, event.getLimits());
+            }
+
             logger.debug("Updated layer metadata in Redis: {}", layerId);
 
         } catch (Exception e) {
             logger.error("Failed to sync layer to Redis: {}", layerId, e);
+        }
+    }
+
+    /**
+     * Store layer limits in Redis.
+     * - layer:limits:{layerId} = set of limitIds that apply to this layer
+     * - limit:{limitId} = hash with maxValue
+     * - limit:{limitId}:running = counter of currently running frames
+     */
+    private void updateLayerLimits(String layerId, Map<String, Integer> limits) {
+        String layerLimitsKey = LAYER_LIMITS_PREFIX + layerId;
+
+        // Clear existing limits for this layer
+        redisTemplate.delete(layerLimitsKey);
+
+        for (Map.Entry<String, Integer> entry : limits.entrySet()) {
+            String limitId = entry.getKey();
+            int maxValue = entry.getValue();
+
+            // Add limit to layer's limit set
+            redisTemplate.opsForSet().add(layerLimitsKey, limitId);
+
+            // Store/update limit metadata
+            String limitKey = LIMIT_PREFIX + limitId;
+            redisTemplate.opsForHash().put(limitKey, "maxValue", String.valueOf(maxValue));
+
+            // Initialize running counter if not exists
+            String runningKey = LIMIT_PREFIX + limitId + ":running";
+            if (Boolean.FALSE.equals(redisTemplate.hasKey(runningKey))) {
+                redisTemplate.opsForValue().set(runningKey, "0");
+            }
+
+            logger.debug("Stored limit {} with maxValue {} for layer {}", limitId, maxValue, layerId);
         }
     }
 
@@ -270,6 +358,8 @@ public class RedisSchedulingEventListener {
                     redisTemplate.delete(FRAMES_WAITING_PREFIX + layerId);
                     // Delete layer metadata
                     redisTemplate.delete(LAYER_PREFIX + layerId);
+                    // Delete layer limits set
+                    redisTemplate.delete(LAYER_LIMITS_PREFIX + layerId);
                 }
             }
 

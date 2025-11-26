@@ -31,28 +31,63 @@ local threadMode = tonumber(ARGV[6])
 local limit = tonumber(ARGV[7])
 local noGpu = tonumber(ARGV[8] or 0)
 
--- Helper function to check if host tags match layer tags
--- Layer tags use regex pattern, host tags is a space/comma separated list
+-- Helper function to check if host tags match layer tags using word boundaries
+-- SQL: host.str_tags ~* ('(?x)' || layer.str_tags || '\y')
+-- This matches whole words, not substrings
 local function tagsMatch(hostTagStr, layerTagPattern)
     if layerTagPattern == nil or layerTagPattern == '' then
         return true
     end
 
-    -- Simple pattern matching: check if any host tag matches the layer pattern
-    -- In production, this would need proper regex support
-    -- For PoC, we do a simple substring/contains check
     local hostTagsLower = string.lower(hostTagStr)
     local patternLower = string.lower(layerTagPattern)
 
     -- Split pattern by | (OR in regex)
     for pattern in string.gmatch(patternLower, "[^|]+") do
         pattern = pattern:gsub("^%s*(.-)%s*$", "%1") -- trim
-        if string.find(hostTagsLower, pattern, 1, true) then
+
+        -- Word boundary matching: check if pattern appears as a whole word
+        -- Check for pattern at start, end, or surrounded by non-word chars
+        local wordPattern = "%f[%w]" .. pattern:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1") .. "%f[%W]"
+        if string.find(hostTagsLower, wordPattern) then
             return true
+        end
+
+        -- Also check exact match for simple cases
+        for tag in string.gmatch(hostTagsLower, "[%w_]+") do
+            if tag == pattern then
+                return true
+            end
         end
     end
 
     return false
+end
+
+-- Helper function to check if layer limits allow dispatch
+-- Returns true if all limits have capacity, false if any limit is maxed out
+local function checkLayerLimits(layerId)
+    local layerLimitsKey = 'layer:limits:' .. layerId
+    local limitIds = redis.call('SMEMBERS', layerLimitsKey)
+
+    if #limitIds == 0 then
+        return true -- No limits = always allowed
+    end
+
+    for _, limitId in ipairs(limitIds) do
+        local limitKey = 'limit:' .. limitId
+        local runningKey = 'limit:' .. limitId .. ':running'
+
+        local maxValue = tonumber(redis.call('HGET', limitKey, 'maxValue') or 0)
+        local running = tonumber(redis.call('GET', runningKey) or 0)
+
+        if maxValue > 0 and running >= maxValue then
+            -- Limit is maxed out - cannot dispatch to this layer
+            return false
+        end
+    end
+
+    return true -- All limits have capacity
 end
 
 -- Get all layer IDs that have waiting frames for this job
@@ -119,8 +154,13 @@ for _, layerId in ipairs(layerIds) do
             resourcesMatch = false
         end
 
-        -- Check tags
+        -- Check tags (with word boundary matching)
         if resourcesMatch and not tagsMatch(hostTags, layerTags) then
+            resourcesMatch = false
+        end
+
+        -- Check layer limits - CRITICAL for 1-to-1 SQL parity
+        if resourcesMatch and not checkLayerLimits(layerId) then
             resourcesMatch = false
         end
 
