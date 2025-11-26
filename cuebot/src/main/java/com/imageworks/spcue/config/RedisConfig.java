@@ -34,6 +34,7 @@ import org.springframework.scripting.support.ResourceScriptSource;
 
 import java.util.List;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * Redis configuration for scheduling cache.
@@ -106,9 +107,9 @@ public class RedisConfig {
         executor.setMaxPoolSize(16);
         executor.setQueueCapacity(1000);
         executor.setThreadNamePrefix("redis-sync-");
-        executor.setRejectedExecutionHandler((r, e) -> {
-            logger.warn("Redis sync task rejected - queue full, dropping event");
-        });
+        // CallerRunsPolicy ensures no events are dropped - if queue is full,
+        // the task runs in the caller's thread, maintaining SQL/Redis sync
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         executor.initialize();
         logger.info("Redis async executor initialized with {} core threads", executor.getCorePoolSize());
         return executor;
