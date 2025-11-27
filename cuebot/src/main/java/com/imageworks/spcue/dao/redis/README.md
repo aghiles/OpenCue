@@ -19,30 +19,9 @@ This document describes the Redis-based scheduling cache implementation for Open
 | What We Cache | What Stays in SQL |
 |---------------|-------------------|
 | `frames:waiting:*` (sorted sets) | Job finding (already fast) |
-| `layer:*` (resource requirements) | Dependencies (state-based) |
+| `layer:*` (resource requirements) | Dependencies (state-based, see [Annex A](#annex-a-how-dependencies-work)) |
 | `job:*` (metadata for DispatchFrame) | Frame booking (writes) |
 | `limit:*` (running counters) | All transactional operations |
-
-### How Dependencies Work
-
-Frame dependencies are **transparent to Redis** because they're handled via state transitions:
-
-```
-Frame with unmet dependency     Frame dependency satisfied
-         │                               │
-         ▼                               ▼
-┌─────────────────┐             ┌─────────────────┐
-│ DEPEND state    │ ──────────▶ │ WAITING state   │
-│ (not in Redis)  │  satisfyDepend()  │ (in Redis)      │
-└─────────────────┘             └─────────────────┘
-```
-
-1. Frames with unmet dependencies stay in `DEPEND` state - **not cached in Redis**
-2. When dependencies are satisfied, `DependManagerService.satisfyDepend()` transitions frame to `WAITING`
-3. The state change fires `FrameStateChangedEvent(DEPEND → WAITING)`
-4. Redis listener adds the frame to `frames:waiting:{layerId}`
-
-This means Redis never needs to know about dependency logic - it just sees frames appear when they become dispatchable.
 
 ## Problem Statement
 
@@ -531,3 +510,43 @@ The Redis scheduling cache provides:
 6. **Low memory footprint** (~100 MB for 500k frames)
 
 The implementation is **simple and focused**: only frame dispatch queries use Redis (the expensive part). Job finding stays in SQL because it's already fast (simple index lookups returning job IDs). This keeps the architecture simple while solving the actual bottleneck.
+
+---
+
+## Annex A: How Dependencies Work
+
+Frame dependencies are **transparent to Redis** because they're handled via state transitions:
+
+1. Frames with unmet dependencies stay in `DEPEND` state - **not cached in Redis**
+2. When dependencies are satisfied, `DependManagerService.satisfyDepend()` transitions frame to `WAITING`
+3. The state change fires `FrameStateChangedEvent(DEPEND → WAITING)`
+4. Redis listener adds the frame to `frames:waiting:{layerId}`
+
+This means Redis never needs to know about dependency logic - it just sees frames appear when they become dispatchable. The reverse also works: if a dependency is added to a WAITING frame, it transitions to DEPEND and is removed from Redis.
+
+## Annex B: Redis Cluster Considerations
+
+The current key design is optimized for **single Redis instance** or **Redis Sentinel** (for high availability).
+
+### Why Cluster Needs Changes
+
+Redis Cluster distributes keys across nodes using hash slots. Lua scripts require all accessed keys to be on the **same node**. Our `find_dispatch_frames.lua` accesses multiple key patterns that would be distributed across nodes:
+- `layers:waiting:{jobId}`
+- `layer:{layerId}` (multiple)
+- `frames:waiting:{layerId}` (multiple)
+
+### Cluster-Compatible Key Design
+
+To support Redis Cluster, keys would need hash tags to co-locate related data:
+
+| Current Key | Cluster-Compatible Key |
+|-------------|------------------------|
+| `layers:waiting:{jobId}` | `{job:jobId}:layers:waiting` |
+| `layer:{layerId}` | `{job:jobId}:layer:{layerId}` |
+| `frames:waiting:{layerId}` | `{job:jobId}:frames:waiting:{layerId}` |
+
+The `{job:jobId}` hash tag ensures all data for a job lands on the same node.
+
+### Recommendation
+
+Given the memory footprint (~100MB for 500k frames), a single Redis instance with Sentinel is likely sufficient for most deployments. Redis Cluster should only be considered at extreme scale (millions of concurrent frames).
