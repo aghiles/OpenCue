@@ -328,8 +328,10 @@ public class RedisCacheWarmupService {
             int dispatchOrder = ((Number) row.get("int_dispatch_order")).intValue();
             int layerOrder = ((Number) row.get("int_layer_order")).intValue();
 
-            // Calculate sort score (same as event listener)
-            double sortScore = layerOrder * 1000000.0 + dispatchOrder;
+            // Calculate sort score (same as event listener and SQL ORDER BY)
+            // SQL: ORDER BY frame.int_dispatch_order ASC, frame.int_layer_order ASC
+            // dispatchOrder is primary, layerOrder is secondary (tiebreaker)
+            double sortScore = dispatchOrder + (layerOrder / 1000000.0);
 
             // Add to waiting frames sorted set
             String waitingKey = FRAMES_WAITING_PREFIX + layerId;
