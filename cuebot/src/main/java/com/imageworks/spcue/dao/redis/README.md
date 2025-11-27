@@ -628,7 +628,7 @@ For each frame returned in Step 3:
 **Redis Update (Step 4.5):**
 ```
 ZREM frames:waiting:{layerId} {frameId}    -- Remove from waiting set
-HSET frame:{frameId} state RUNNING         -- Update frame state
+DEL frame:{frameId}                        -- Delete frame hash (no longer needed)
 ```
 
 ### Step 5: Frame Completion
@@ -639,17 +639,11 @@ The render host reports frame completion.
 |------|-----------|--------|
 | 5.1 | `FrameCompleteHandler.handleFrameCompleteReport()` | Receives completion report |
 | 5.2 | `FrameDao.updateFrameCompleted()` | Sets frame state to `SUCCEEDED` in SQL |
-| 5.3 | `SchedulingEventPublisher.publishFrameStateChanged()` | Fires `FrameStateChangedEvent` |
-| 5.4 | `RedisSchedulingEventListener.onFrameStateChanged()` | **Updates Redis (async, after commit)** |
-| 5.5 | `DependManagerService.satisfyDepend()` | Checks if dependencies are satisfied |
+| 5.3 | `DependManagerService.satisfyDepend()` | Checks if dependencies are satisfied |
 
-**Redis Update (Step 5.4):**
-```
-DEL frame:{frameId}                        -- Remove frame hash (no longer needed)
--- Frame already removed from waiting set in Step 4.5
-```
+**Note:** No Redis update needed here - the frame was already removed from Redis when it started running (Step 4.5). Redis only tracks WAITING frames.
 
-**If frame had dependents (Step 5.5):**
+**If frame had dependents (Step 5.3):**
 - Dependent frames transition from `DEPEND` → `WAITING`
 - `FrameStateChangedEvent(DEPEND → WAITING)` fires
 - Redis listener adds newly-waiting frames to `frames:waiting:{layerId}`
