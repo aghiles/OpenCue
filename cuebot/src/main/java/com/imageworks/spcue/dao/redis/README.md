@@ -93,7 +93,7 @@ Use Lua scripts for atomic, server-side filtering and selection.
 
 ### Data Flow
 
-1. **Startup**: `RedisCacheWarmupService` loads all PENDING jobs, layers, and WAITING frames from SQL into Redis
+1. **Startup**: `RedisCacheWarmupService` loads job metadata, layers, and WAITING frames from SQL into Redis
 2. **New Job Launch**: `warmupJob()` populates Redis with the new job's layers and frames
 3. **Runtime Changes**: Event listeners update Redis after SQL transactions commit
 4. **Dispatch Queries**: Lua scripts query Redis atomically, with SQL fallback if needed
@@ -236,9 +236,9 @@ public void init() {
 
 Order of population:
 1. **Limits** - Global limit records and running counts
-2. **Jobs** - All PENDING, non-paused jobs
-3. **Layers** - All layers for pending jobs
-4. **Frames** - All WAITING frames for pending jobs
+2. **Job metadata** - Metadata for active jobs (for building DispatchFrame objects)
+3. **Layers** - All layers for active jobs
+4. **Frames** - All WAITING frames for active jobs
 
 ### New Job Warmup
 
