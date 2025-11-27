@@ -550,3 +550,132 @@ The `{job:jobId}` hash tag ensures all data for a job lands on the same node.
 ### Recommendation
 
 Given the memory footprint (~100MB for 500k frames), a single Redis instance with Sentinel is likely sufficient for most deployments. Redis Cluster should only be considered at extreme scale (millions of concurrent frames).
+
+## Annex C: Step-by-Step Execution Flow
+
+This section walks through the complete lifecycle: job submission, host dispatch, and frame completion.
+
+### Step 1: Job Submission
+
+A user submits a job with 1000 frames across 2 layers.
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 1.1 | `JobLauncher` | Receives job spec via gRPC |
+| 1.2 | `JobManagerService.launchJobSpec()` | Creates job, layers, frames in PostgreSQL |
+| 1.3 | `JobDao.activateJob()` | Sets job state to `PENDING` in SQL |
+| 1.4 | `RedisCacheWarmupService.warmupJob()` | Populates Redis with job data |
+
+**Redis after Step 1.4:**
+```
+job:{jobId}                    → {showId, priority, state, ...}
+layer:{layer1Id}               → {minCores, minMemory, tags, ...}
+layer:{layer2Id}               → {minCores, minMemory, tags, ...}
+layers:waiting:{jobId}         → [layer1Id, layer2Id]
+frames:waiting:{layer1Id}      → [frame1..500 with scores]
+frames:waiting:{layer2Id}      → [frame501..1000 with scores]
+frame:{frame1Id}               → {layerId, jobId, state, ...}
+... (1000 frame hashes)
+```
+
+### Step 2: Host Reports In
+
+A render host with 64 cores and 128GB RAM sends a host report.
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 2.1 | `HostReportHandler.handleHostReport()` | Receives host report via gRPC |
+| 2.2 | `DispatchSupport.findUnderProcedJob()` | Finds jobs for host's show (SQL query) |
+| 2.3 | `DispatchBookHost.run()` | Starts dispatch loop for each job |
+
+### Step 3: Frame Dispatch (per job)
+
+For each job found in Step 2.2:
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 3.1 | `CoreUnitDispatcher.dispatchHost()` | Entry point for job dispatch |
+| 3.2 | `RedisDispatchSupport.findNextDispatchFrames()` | **Redis query via Lua script** |
+| 3.3 | `RedisDispatcherDao.findNextDispatchFrames()` | Executes `find_dispatch_frames.lua` |
+| 3.4 | Lua script | Filters layers by host resources, returns frame IDs |
+| 3.5 | `RedisDispatcherDao` | Builds `DispatchFrame` objects from Redis hashes |
+| 3.6 | `CoreUnitDispatcher.dispatch()` | Books frame on host |
+
+**Lua Script Execution (Step 3.4):**
+1. Get layers with waiting frames: `SMEMBERS layers:waiting:{jobId}`
+2. For each layer, check resources: `HGETALL layer:{layerId}`
+3. If layer fits host, get frames: `ZRANGE frames:waiting:{layerId} 0 N`
+4. Return frame IDs that fit remaining host resources
+
+**If Redis returns empty or fails:**
+- `RedisDispatchSupport` falls back to `DispatchSupportService` (SQL)
+- Dispatch continues normally, just slower
+
+### Step 4: Frame Booking
+
+For each frame returned in Step 3:
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 4.1 | `DispatchSupport.determineChunk()` | Calculates resources to allocate |
+| 4.2 | `BookingManager.createBooking()` | Creates proc record in SQL |
+| 4.3 | `FrameDao.updateFrameStarted()` | Updates frame state to `RUNNING` in SQL |
+| 4.4 | `SchedulingEventPublisher.publishFrameStateChanged()` | Fires `FrameStateChangedEvent` |
+| 4.5 | `RedisSchedulingEventListener.onFrameStateChanged()` | **Updates Redis (async, after commit)** |
+
+**Redis Update (Step 4.5):**
+```
+ZREM frames:waiting:{layerId} {frameId}    -- Remove from waiting set
+HSET frame:{frameId} state RUNNING         -- Update frame state
+```
+
+### Step 5: Frame Completion
+
+The render host reports frame completion.
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 5.1 | `FrameCompleteHandler.handleFrameCompleteReport()` | Receives completion report |
+| 5.2 | `FrameDao.updateFrameCompleted()` | Sets frame state to `SUCCEEDED` in SQL |
+| 5.3 | `SchedulingEventPublisher.publishFrameStateChanged()` | Fires `FrameStateChangedEvent` |
+| 5.4 | `RedisSchedulingEventListener.onFrameStateChanged()` | **Updates Redis (async, after commit)** |
+| 5.5 | `DependManagerService.satisfyDepend()` | Checks if dependencies are satisfied |
+
+**Redis Update (Step 5.4):**
+```
+DEL frame:{frameId}                        -- Remove frame hash (no longer needed)
+-- Frame already removed from waiting set in Step 4.5
+```
+
+**If frame had dependents (Step 5.5):**
+- Dependent frames transition from `DEPEND` → `WAITING`
+- `FrameStateChangedEvent(DEPEND → WAITING)` fires
+- Redis listener adds newly-waiting frames to `frames:waiting:{layerId}`
+
+### Step 6: Job Completion
+
+When all frames are done:
+
+| Step | Component | Action |
+|------|-----------|--------|
+| 6.1 | `JobManagerService.setJobFinished()` | Sets job state to `FINISHED` in SQL |
+| 6.2 | `SchedulingEventPublisher.publishJobCompleted()` | Fires `JobCompletedEvent` |
+| 6.3 | `RedisSchedulingEventListener.onJobCompleted()` | **Cleans up Redis** |
+
+**Redis Cleanup (Step 6.3):**
+```
+DEL job:{jobId}                            -- Remove job hash
+DEL layers:waiting:{jobId}                 -- Remove layers set
+-- Layer and frame data already cleaned up during frame completions
+```
+
+### Summary: Where Redis Is Used
+
+| Operation | Uses Redis? | Notes |
+|-----------|-------------|-------|
+| Job finding | No | SQL query (fast index lookup) |
+| Frame dispatch | **Yes** | Lua script for filtering |
+| Frame booking | No | SQL write (source of truth) |
+| State updates | No | SQL write, then async Redis update |
+| Dependency resolution | No | SQL-based, triggers Redis events |
+| Job cleanup | **Yes** | Removes job data from Redis |
