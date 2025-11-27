@@ -18,7 +18,6 @@ package com.imageworks.spcue.dao.redis;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 import javax.annotation.PostConstruct;
 
@@ -28,7 +27,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import com.imageworks.spcue.grpc.job.FrameState;
@@ -40,7 +38,9 @@ import com.imageworks.spcue.grpc.job.JobState;
  * This ensures Redis has correct data after a cuebot restart.
  * Once populated, incremental updates are handled by event publishing.
  *
- * The warm-up runs asynchronously to not block application startup.
+ * The warm-up runs SYNCHRONOUSLY at startup - the application will not
+ * accept scheduling requests until warmup is complete. This is simpler
+ * and safer than async warmup with ready flags.
  */
 @Service
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -69,22 +69,13 @@ public class RedisCacheWarmupService {
     }
 
     /**
-     * Warm up Redis cache after application startup.
-     * Runs asynchronously to not block startup.
+     * Warm up Redis cache at application startup.
+     * Runs SYNCHRONOUSLY - application won't accept requests until complete.
      */
     @PostConstruct
-    public void scheduleWarmup() {
-        logger.info("Scheduling Redis cache warm-up...");
-        // Run async after a short delay to let other beans initialize
-        new Thread(() -> {
-            try {
-                Thread.sleep(5000); // Wait 5 seconds for app to stabilize
-                warmupCache();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                logger.warn("Redis warm-up interrupted");
-            }
-        }, "redis-warmup").start();
+    public void init() {
+        logger.info("Starting synchronous Redis cache warm-up...");
+        warmupCache();
     }
 
     /**
