@@ -30,7 +30,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import com.imageworks.spcue.grpc.job.FrameState;
-import com.imageworks.spcue.grpc.job.JobState;
 
 /**
  * Populates Redis cache from SQL on application startup.
@@ -57,7 +56,6 @@ public class RedisCacheWarmupService {
     private static final String LAYER_PREFIX = "layer:";
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
     private static final String JOB_PREFIX = "job:";
-    private static final String JOBS_PENDING_PREFIX = "jobs:pending:";
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
@@ -92,8 +90,9 @@ public class RedisCacheWarmupService {
             // Populate limits first (they're referenced by layers)
             int limitCount = warmupLimits();
 
-            // Populate pending jobs
-            int jobCount = warmupPendingJobs();
+            // Populate job metadata (needed for building DispatchFrame objects)
+            // Note: Job finding queries stay in SQL - only frame dispatch uses Redis
+            int jobCount = warmupJobMetadata();
 
             // Populate layers and their limits
             int layerCount = warmupLayers();
@@ -157,9 +156,12 @@ public class RedisCacheWarmupService {
     }
 
     /**
-     * Warm up pending jobs.
+     * Warm up job metadata for pending jobs.
+     *
+     * Note: Job FINDING queries stay in SQL (they're already fast - simple index lookups).
+     * We only cache job metadata so we can build DispatchFrame objects from Redis frame data.
      */
-    private int warmupPendingJobs() {
+    private int warmupJobMetadata() {
         String sql = "SELECT j.pk_job, j.pk_show, j.pk_folder, j.pk_facility, " +
                      "j.str_name, j.str_state, j.b_paused, j.str_os, j.str_shot, j.str_user, j.str_log_dir, " +
                      "s.str_name AS show_name, " +
@@ -182,11 +184,7 @@ public class RedisCacheWarmupService {
             String showId = (String) row.get("pk_show");
             String facilityId = (String) row.get("pk_facility");
 
-            // Add to pending jobs set
-            String pendingKey = JOBS_PENDING_PREFIX + showId + ":" + facilityId;
-            redisTemplate.opsForSet().add(pendingKey, jobId);
-
-            // Store job metadata
+            // Store job metadata (needed for building DispatchFrame objects)
             String jobKey = JOB_PREFIX + jobId;
             Map<String, String> jobData = new HashMap<>();
             jobData.put("showId", showId);
@@ -216,7 +214,7 @@ public class RedisCacheWarmupService {
             count++;
         }
 
-        logger.debug("Warmed up {} pending jobs", count);
+        logger.debug("Warmed up {} job metadata entries", count);
         return count;
     }
 

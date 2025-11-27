@@ -15,9 +15,7 @@
 
 package com.imageworks.spcue.dao.redis;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -27,20 +25,20 @@ import org.springframework.stereotype.Service;
 
 import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
-import com.imageworks.spcue.DispatchJob;
-import com.imageworks.spcue.GroupInterface;
 import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.LayerInterface;
-import com.imageworks.spcue.ShowInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.DispatcherDao;
 
 /**
- * Redis-enhanced dispatch support.
+ * Redis-enhanced dispatch support for FRAME queries only.
  *
  * Provides a Redis-first approach for finding dispatch frames:
  * 1. Try Redis for fast frame lookup
  * 2. Fall back to SQL DAO if Redis fails or returns empty results
+ *
+ * Job finding queries remain in SQL as they are already fast
+ * (simple index lookups returning just job IDs).
  *
  * This service is only active when redis.scheduling.enabled=true.
  */
@@ -58,7 +56,7 @@ public class RedisDispatchSupport {
                                  DispatcherDao sqlDispatcherDao) {
         this.redisDispatcherDao = redisDispatcherDao;
         this.sqlDispatcherDao = sqlDispatcherDao;
-        logger.info("Redis dispatch support initialized - Redis-first dispatch enabled");
+        logger.info("Redis dispatch support initialized - Redis-first frame dispatch enabled");
     }
 
     /**
@@ -161,54 +159,5 @@ public class RedisDispatchSupport {
 
         // Fall back to SQL
         return sqlDispatcherDao.findNextDispatchFrames(layer, proc, limit);
-    }
-
-    // ============================================================
-    // JOB DISPATCH METHODS
-    // ============================================================
-
-    /**
-     * Find dispatch jobs for a show using Redis with SQL fallback.
-     * Returns job IDs for compatibility with existing code.
-     */
-    public Set<String> findDispatchJobs(DispatchHost host, ShowInterface show, int numJobs) {
-        long startTime = System.currentTimeMillis();
-
-        List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(show, host, numJobs);
-
-        if (!jobs.isEmpty()) {
-            Set<String> jobIds = new HashSet<>(jobs.size());
-            for (DispatchJob job : jobs) {
-                jobIds.add(job.id);
-            }
-            logger.debug("Redis dispatch (show): found {} jobs in {}ms",
-                    jobs.size(), System.currentTimeMillis() - startTime);
-            return jobIds;
-        }
-
-        // Fall back to SQL
-        return sqlDispatcherDao.findDispatchJobs(host, show, numJobs);
-    }
-
-    /**
-     * Find dispatch jobs for a group using Redis with SQL fallback.
-     */
-    public Set<String> findDispatchJobs(DispatchHost host, GroupInterface group) {
-        long startTime = System.currentTimeMillis();
-
-        List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(group, host, 50);
-
-        if (!jobs.isEmpty()) {
-            Set<String> jobIds = new HashSet<>(jobs.size());
-            for (DispatchJob job : jobs) {
-                jobIds.add(job.id);
-            }
-            logger.debug("Redis dispatch (group): found {} jobs in {}ms",
-                    jobs.size(), System.currentTimeMillis() - startTime);
-            return jobIds;
-        }
-
-        // Fall back to SQL
-        return sqlDispatcherDao.findDispatchJobs(host, group);
     }
 }

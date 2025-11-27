@@ -194,54 +194,8 @@ public class JobManagerService implements JobManager {
     @Transactional(propagation = Propagation.REQUIRED)
     public void setJobPaused(JobInterface job, boolean paused) {
         jobDao.updatePaused(job, paused);
-        // Publish job state change for Redis cache sync
-        if (schedulingEventPublisher != null) {
-            try {
-                JobDetail jobDetail = jobDao.getJobDetail(job.getJobId());
-                GroupDetail group = groupDao.getGroupDetail(job);
-                publishJobStateChange(jobDetail, group);
-            } catch (Exception e) {
-                logger.warn("Failed to publish job pause state change for Redis: {}", job.getJobId(), e);
-            }
-        }
-    }
-
-    /**
-     * Helper method to publish job state changes to Redis.
-     * Uses data from JobDetail and GroupDetail to populate all required fields.
-     */
-    private void publishJobStateChange(JobDetail jobDetail, GroupDetail group) {
-        if (schedulingEventPublisher == null) {
-            return;
-        }
-
-        schedulingEventPublisher.publishJobStateChanged(
-                jobDetail.id,
-                jobDetail.showId,
-                jobDetail.facilityId,
-                jobDetail.groupId,
-                jobDetail.state,
-                jobDetail.isPaused,
-                null, // os - not stored in JobDetail, will use default
-                jobDetail.priority,
-                0, // current cores - starts at 0 for new jobs
-                jobDetail.minCoreUnits,
-                jobDetail.maxCoreUnits,
-                0, // current gpus - starts at 0 for new jobs
-                jobDetail.maxGpuUnits,
-                System.currentTimeMillis() / 1000, // tsUpdated
-                0, // folder current cores
-                group != null ? group.maxCores : -1,
-                0, // folder current gpus
-                group != null ? group.maxGpus : -1,
-                jobDetail.showName,
-                jobDetail.name,
-                jobDetail.shot,
-                jobDetail.user,
-                jobDetail.uid.orElse(null),
-                jobDetail.logDir,
-                jobDetail.logLokiURL
-        );
+        // Note: Job pause state is not tracked in Redis.
+        // Job finding queries use SQL which handles pause filtering.
     }
 
     @Transactional(propagation = Propagation.REQUIRED)
@@ -273,17 +227,9 @@ public class JobManagerService implements JobManager {
 
         for (BuildableJob job : spec.getJobs()) {
             jobDao.activateJob(job.detail, JobState.PENDING);
-            // Update state to PENDING and publish to Redis
             job.detail.state = JobState.PENDING;
-            if (schedulingEventPublisher != null) {
-                try {
-                    GroupDetail group = groupDao.getGroupDetail(job.detail);
-                    publishJobStateChange(job.detail, group);
-                } catch (Exception e) {
-                    logger.warn("Failed to publish job activation for Redis: {}", job.detail.id, e);
-                }
-            }
             // Warm up Redis cache with layers and frames for this job
+            // (Job finding uses SQL, but frame dispatch uses Redis)
             if (redisCacheWarmupService != null) {
                 try {
                     redisCacheWarmupService.warmupJob(job.detail.id);

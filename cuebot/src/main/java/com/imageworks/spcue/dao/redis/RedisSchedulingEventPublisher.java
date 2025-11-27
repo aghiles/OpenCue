@@ -22,17 +22,18 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 
 import com.imageworks.spcue.FrameInterface;
-import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.grpc.job.FrameState;
-import com.imageworks.spcue.grpc.job.JobState;
 
 /**
  * Redis-enabled implementation of SchedulingEventPublisher.
  *
- * Publishes scheduling events to Spring's ApplicationEventPublisher,
+ * Publishes FRAME scheduling events to Spring's ApplicationEventPublisher,
  * which are then handled by RedisSchedulingEventListener after the
  * transaction commits.
+ *
+ * Job finding queries remain in SQL (they're already fast), so
+ * we don't publish job state change events.
  *
  * This decouples the DAO layer from Redis implementation details.
  */
@@ -46,7 +47,7 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
 
     public RedisSchedulingEventPublisher(ApplicationEventPublisher eventPublisher) {
         this.eventPublisher = eventPublisher;
-        logger.info("Redis scheduling event publisher initialized");
+        logger.info("Redis scheduling event publisher initialized (frame events only)");
     }
 
     @Override
@@ -95,29 +96,6 @@ public class RedisSchedulingEventPublisher implements SchedulingEventPublisher {
     public void publishJobCompleted(String jobId, String showId, String facilityId) {
         logger.debug("Publishing job completed: {}", jobId);
         eventPublisher.publishEvent(new JobCompletedEvent(jobId, showId, facilityId));
-    }
-
-    @Override
-    public void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
-                                        JobState state, boolean paused, String os,
-                                        int priority, int cores, int minCores, int maxCores,
-                                        int gpus, int maxGpus, long tsUpdated,
-                                        int folderCores, int folderMaxCores,
-                                        int folderGpus, int folderMaxGpus,
-                                        String showName, String jobName, String shot,
-                                        String owner, Integer uid, String logDir, String lokiURL) {
-        logger.trace("Publishing job state change: {} state={} paused={}", jobId, state, paused);
-
-        JobStateChangedEvent event = new JobStateChangedEvent(
-                jobId, showId, facilityId, folderId,
-                state, paused, os,
-                priority, cores, minCores, maxCores,
-                gpus, maxGpus, tsUpdated,
-                folderCores, folderMaxCores, folderGpus, folderMaxGpus,
-                showName, jobName, shot, owner, uid, logDir, lokiURL
-        );
-
-        eventPublisher.publishEvent(event);
     }
 
     /**

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the Redis-based scheduling cache implementation for OpenCue's cuebot. The cache accelerates frame dispatch operations by moving hot-path queries from PostgreSQL to Redis.
+This document describes the Redis-based scheduling cache implementation for OpenCue's cuebot. The cache accelerates **frame dispatch operations** by moving hot-path queries from PostgreSQL to Redis.
 
 ### Key Design Principles
 
@@ -11,6 +11,8 @@ This document describes the Redis-based scheduling cache implementation for Open
 2. **Redis failures gracefully fall back to SQL.** If Redis is unavailable, returns empty results, or throws an exception, the system automatically falls back to the original SQL queries. The scheduler continues to work—just slower.
 
 3. **No data loss risk.** Since Redis is only used for read queries (finding frames to dispatch), losing Redis data has zero impact on job integrity. A restart simply re-warms the cache from PostgreSQL.
+
+4. **Keep it simple.** Only the expensive FRAME dispatch queries use Redis. Job finding queries stay in SQL because they're already fast (simple index lookups returning just job IDs).
 
 ## Problem Statement
 
@@ -108,10 +110,11 @@ Use Lua scripts for atomic, server-side filtering and selection.
 | `layer:{layerId}` | Hash | Layer metadata (minCores, minMemory, tags, etc.) |
 | `layers:waiting:{jobId}` | Set | Layer IDs that have waiting frames |
 | `job:{jobId}` | Hash | Job metadata (showId, priority, state, etc.) |
-| `jobs:pending:{showId}:{facilityId}` | Set | Job IDs that are pending and not paused |
 | `limit:{limitId}` | Hash | Limit metadata (maxValue, name) |
 | `limit:{limitId}:running` | String | Current running count (atomic counter) |
 | `layer:limits:{layerId}` | Set | Limit IDs that apply to this layer |
+
+**Note:** Job finding uses SQL (not Redis). The `job:{jobId}` hashes store metadata needed to build `DispatchFrame` objects from Redis frame data.
 
 ### Priority Score Calculation
 
@@ -185,10 +188,6 @@ local maxByResources = math.min(limit, maxByCores, maxByMemory)
 return redis.call('ZRANGE', framesWaitingKey, 0, maxByResources - 1)
 ```
 
-### find_jobs_by_show.lua
-
-Finds pending jobs for a show that match host requirements.
-
 ## Event Publishing System
 
 ### Components
@@ -204,9 +203,10 @@ Finds pending jobs for a show that match host requirements.
 | Event | Trigger | Redis Update |
 |-------|---------|--------------|
 | `FrameStateChangedEvent` | Frame state changes | Add/remove from waiting set, update counters |
-| `JobStateChangedEvent` | Job state/pause changes | Add/remove from pending set |
 | `LayerUpdatedEvent` | Layer resource changes | Update layer hash |
 | `JobCompletedEvent` | Job finishes | Cleanup all job data |
+
+**Note:** Job state changes (pause/unpause) don't trigger Redis events because job finding uses SQL.
 
 ### Transaction Safety
 
@@ -247,9 +247,9 @@ When a job is launched after startup, `warmupJob()` is called:
 ```java
 // In JobManagerService.launchJobSpec()
 jobDao.activateJob(job.detail, JobState.PENDING);
-publishJobStateChange(job.detail, group);
 
 // Warm up Redis cache with layers and frames for this job
+// (Job finding uses SQL, but frame dispatch uses Redis)
 if (redisCacheWarmupService != null) {
     redisCacheWarmupService.warmupJob(job.detail.id);
 }
@@ -353,7 +353,6 @@ Total: O(L × (1 + T + Li + log F))
 | **Layer hashes** | 20,000 | 500 bytes | 10 MB |
 | **Job hashes** | 1,000 | 650 bytes | 0.65 MB |
 | **Layers waiting sets** | 1,000 jobs × 20 entries | 50 bytes | 1 MB |
-| **Jobs pending sets** | ~100 show/facility combos | 40 bytes × 10 jobs | 0.04 MB |
 | **Limit data** | 100 limits | 100 bytes | 0.01 MB |
 | **Redis overhead** | ~30% for internal structures | - | ~22 MB |
 
@@ -407,7 +406,7 @@ redis.scheduling.enabled=false
 ```
 
 When disabled:
-- `NoOpSchedulingEventPublisher` is used (events are no-ops)
+- No `SchedulingEventPublisher` bean is created (null checks in code handle this)
 - `RedisDispatchSupport` bean is not created
 - All dispatch queries go directly to SQL
 
@@ -420,7 +419,6 @@ cuebot/src/main/java/com/imageworks/spcue/dao/redis/
 ├── RedisSchedulingEventPublisher.java # Redis implementation
 ├── RedisSchedulingEventListener.java  # Listens and updates Redis
 ├── FrameStateChangedEvent.java      # Frame state change event
-├── JobStateChangedEvent.java        # Job state change event
 ├── LayerUpdatedEvent.java           # Layer update event
 ├── RedisDispatcherDao.java          # Redis queries with Lua
 ├── RedisDispatchSupport.java        # Redis-first with SQL fallback
@@ -428,9 +426,10 @@ cuebot/src/main/java/com/imageworks/spcue/dao/redis/
 
 cuebot/src/main/resources/lua/
 ├── find_dispatch_frames.lua         # Job-based frame dispatch
-├── find_dispatch_frames_by_layer.lua # Layer-based frame dispatch
-└── find_jobs_by_show.lua            # Find pending jobs for show
+└── find_dispatch_frames_by_layer.lua # Layer-based frame dispatch
 ```
+
+**Note:** Job finding queries stay in SQL - no Lua script for job finding.
 
 ## Operational Considerations
 
@@ -463,11 +462,11 @@ Key metrics to monitor:
 
 The Redis scheduling cache provides:
 
-1. **100x faster dispatching** at scale through in-memory queries
+1. **100x faster frame dispatching** at scale through in-memory queries
 2. **Linear scaling** instead of database contention
 3. **SQL safety** as the source of truth
 4. **Automatic sync** via event publishing
 5. **Graceful degradation** with SQL fallback
 6. **Low memory footprint** (~100 MB for 500k frames)
 
-The implementation is simple, efficient, and focuses on the hot path (frame dispatch) while letting SQL handle less frequent operations.
+The implementation is **simple and focused**: only frame dispatch queries use Redis (the expensive part). Job finding stays in SQL because it's already fast (simple index lookups returning job IDs). This keeps the architecture simple while solving the actual bottleneck.

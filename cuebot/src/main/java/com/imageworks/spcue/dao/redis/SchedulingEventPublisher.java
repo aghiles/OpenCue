@@ -18,17 +18,16 @@ package com.imageworks.spcue.dao.redis;
 import com.imageworks.spcue.FrameInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.grpc.job.FrameState;
-import com.imageworks.spcue.grpc.job.JobState;
 
 /**
- * Interface for publishing scheduling-related events.
+ * Interface for publishing scheduling-related events for FRAME queries.
  *
  * This abstraction allows frame state changes to be propagated to
  * external caching systems (like Redis) without coupling the DAO
  * layer to specific implementations.
  *
- * When Redis is disabled, a no-op implementation is used.
- * When Redis is enabled, events are published for cache synchronization.
+ * Job finding queries remain in SQL (they're already fast), so
+ * we don't need job state change events.
  */
 public interface SchedulingEventPublisher {
 
@@ -71,46 +70,8 @@ public interface SchedulingEventPublisher {
      * Notify that a job has completed and its cache data can be cleaned up.
      *
      * @param jobId      The job ID
-     * @param showId     The show ID
-     * @param facilityId The facility ID
+     * @param showId     The show ID (can be null)
+     * @param facilityId The facility ID (can be null)
      */
     void publishJobCompleted(String jobId, String showId, String facilityId);
-
-    /**
-     * Publish a job state change event with all DispatchFrame fields.
-     *
-     * @param jobId          Job ID
-     * @param showId         Show ID
-     * @param facilityId     Facility ID
-     * @param folderId       Folder ID
-     * @param state          Job state
-     * @param paused         Whether job is paused
-     * @param os             Job OS requirement
-     * @param priority       Job priority
-     * @param cores          Current cores allocated
-     * @param minCores       Minimum cores needed
-     * @param maxCores       Maximum cores allowed
-     * @param gpus           Current GPUs allocated
-     * @param maxGpus        Maximum GPUs allowed
-     * @param tsUpdated      Timestamp of last update
-     * @param folderCores    Folder's current cores
-     * @param folderMaxCores Folder's max cores
-     * @param folderGpus     Folder's current GPUs
-     * @param folderMaxGpus  Folder's max GPUs
-     * @param showName       Show name for DispatchFrame
-     * @param jobName        Job name for DispatchFrame
-     * @param shot           Shot name
-     * @param owner          Job owner
-     * @param uid            User ID
-     * @param logDir         Log directory
-     * @param lokiURL        Loki URL for logging
-     */
-    void publishJobStateChanged(String jobId, String showId, String facilityId, String folderId,
-                                 JobState state, boolean paused, String os,
-                                 int priority, int cores, int minCores, int maxCores,
-                                 int gpus, int maxGpus, long tsUpdated,
-                                 int folderCores, int folderMaxCores,
-                                 int folderGpus, int folderMaxGpus,
-                                 String showName, String jobName, String shot,
-                                 String owner, Integer uid, String logDir, String lokiURL);
 }

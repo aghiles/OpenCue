@@ -25,14 +25,16 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 import com.imageworks.spcue.grpc.job.FrameState;
-import com.imageworks.spcue.grpc.job.JobState;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * Listens for entity change events and syncs them to Redis.
+ * Listens for FRAME state change events and syncs them to Redis.
+ *
+ * Job finding queries remain in SQL - they're already fast (simple index lookups).
+ * Only frame dispatch queries use Redis.
  *
  * Uses @TransactionalEventListener(AFTER_COMMIT) to ensure sync happens
  * only after the SQL transaction commits successfully.
@@ -59,14 +61,12 @@ public class RedisSchedulingEventListener {
     private static final String LAYER_PREFIX = "layer:";
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
     private static final String JOB_PREFIX = "job:";
-    private static final String JOB_LAYERS_WAITING_PREFIX = "job:layers:waiting:";
-    private static final String JOBS_PENDING_PREFIX = "jobs:pending:";
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
     public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
-        logger.info("Redis scheduling event listener initialized");
+        logger.info("Redis scheduling event listener initialized (frame events only)");
     }
 
     /**
@@ -265,88 +265,18 @@ public class RedisSchedulingEventListener {
     }
 
     /**
-     * Handle job state/resource changes.
-     * - When job becomes PENDING and not paused: add to pending jobs set
-     * - When job leaves PENDING or becomes paused: remove from pending jobs set
-     */
-    @Async("redisAsyncExecutor")
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
-    public void onJobStateChanged(JobStateChangedEvent event) {
-        String jobId = event.getJobId();
-        String showId = event.getShowId();
-        String facilityId = event.getFacilityId();
-
-        logger.debug("Job state changed: {} state={} paused={}", jobId, event.getState(), event.isPaused());
-
-        try {
-            String pendingJobsKey = JOBS_PENDING_PREFIX + showId + ":" + facilityId;
-            String jobKey = JOB_PREFIX + jobId;
-
-            if (event.isDispatchable()) {
-                // Job is dispatchable - add to pending jobs set and update metadata
-                redisTemplate.opsForSet().add(pendingJobsKey, jobId);
-
-                // Update job metadata hash with ALL DispatchFrame fields
-                Map<String, String> jobData = new HashMap<>();
-                jobData.put("showId", showId);
-                jobData.put("facilityId", facilityId);
-                jobData.put("folderId", event.getFolderId());
-                jobData.put("state", event.getState().toString());
-                jobData.put("paused", String.valueOf(event.isPaused()));
-                jobData.put("os", event.getOs() != null ? event.getOs() : "");
-                jobData.put("priority", String.valueOf(event.getPriority()));
-                jobData.put("cores", String.valueOf(event.getCores()));
-                jobData.put("minCores", String.valueOf(event.getMinCores()));
-                jobData.put("maxCores", String.valueOf(event.getMaxCores()));
-                jobData.put("gpus", String.valueOf(event.getGpus()));
-                jobData.put("maxGpus", String.valueOf(event.getMaxGpus()));
-                jobData.put("tsUpdated", String.valueOf(event.getTsUpdated()));
-                jobData.put("folderCores", String.valueOf(event.getFolderCores()));
-                jobData.put("folderMaxCores", String.valueOf(event.getFolderMaxCores()));
-                jobData.put("folderGpus", String.valueOf(event.getFolderGpus()));
-                jobData.put("folderMaxGpus", String.valueOf(event.getFolderMaxGpus()));
-                // DispatchFrame fields
-                jobData.put("showName", event.getShowName() != null ? event.getShowName() : "");
-                jobData.put("jobName", event.getJobName() != null ? event.getJobName() : "");
-                jobData.put("shot", event.getShot() != null ? event.getShot() : "");
-                jobData.put("owner", event.getOwner() != null ? event.getOwner() : "");
-                jobData.put("uid", event.getUid() != null ? String.valueOf(event.getUid()) : "");
-                jobData.put("logDir", event.getLogDir() != null ? event.getLogDir() : "");
-                jobData.put("lokiURL", event.getLokiURL() != null ? event.getLokiURL() : "");
-
-                redisTemplate.opsForHash().putAll(jobKey, jobData);
-
-                logger.debug("Added job {} to pending set and updated metadata", jobId);
-
-            } else {
-                // Job is not dispatchable - remove from pending jobs set
-                redisTemplate.opsForSet().remove(pendingJobsKey, jobId);
-
-                // Update state in metadata but keep the data for reference
-                redisTemplate.opsForHash().put(jobKey, "state", event.getState().toString());
-                redisTemplate.opsForHash().put(jobKey, "paused", String.valueOf(event.isPaused()));
-
-                logger.debug("Removed job {} from pending set", jobId);
-            }
-
-        } catch (Exception e) {
-            logger.error("Failed to sync job state to Redis: {}", jobId, e);
-        }
-    }
-
-    /**
      * Handle job completion - clean up Redis data.
      */
     @Async("redisAsyncExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onJobCompleted(RedisSchedulingEventPublisher.JobCompletedEvent event) {
-        cleanupJob(event.getJobId(), event.getShowId(), event.getFacilityId());
+        cleanupJob(event.getJobId());
     }
 
     /**
      * Remove all Redis data for a job (called when job completes/deletes).
      */
-    public void cleanupJob(String jobId, String showId, String facilityId) {
+    public void cleanupJob(String jobId) {
         try {
             // Get all layers for this job
             String layersWaitingKey = LAYERS_WAITING_PREFIX + jobId;
@@ -365,14 +295,6 @@ public class RedisSchedulingEventListener {
 
             // Delete the layers waiting set
             redisTemplate.delete(layersWaitingKey);
-
-            // Delete job:layers:waiting set
-            redisTemplate.delete(JOB_LAYERS_WAITING_PREFIX + jobId);
-
-            // Remove from pending jobs set
-            if (showId != null && facilityId != null) {
-                redisTemplate.opsForSet().remove(JOBS_PENDING_PREFIX + showId + ":" + facilityId, jobId);
-            }
 
             // Delete job metadata
             redisTemplate.delete(JOB_PREFIX + jobId);

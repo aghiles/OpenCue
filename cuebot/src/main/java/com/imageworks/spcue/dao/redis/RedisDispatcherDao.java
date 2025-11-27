@@ -30,30 +30,27 @@ import org.springframework.stereotype.Repository;
 
 import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
-import com.imageworks.spcue.DispatchJob;
-import com.imageworks.spcue.GroupInterface;
 import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.LayerInterface;
-import com.imageworks.spcue.ShowInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.FrameDao;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
- * Redis-based dispatcher DAO for fast frame and job lookups.
+ * Redis-based dispatcher DAO for fast FRAME lookups.
  *
  * Builds DispatchFrame objects entirely from Redis hashes for ZERO SQL on hot path.
  * Falls back to SQL only if Redis data is missing (cache miss).
  *
+ * Job finding queries remain in SQL as they are already fast (simple index lookups).
+ *
  * Redis data structures used:
  * - frame:{frameId} - Frame metadata hash
  * - layer:{layerId} - Layer metadata hash
- * - job:{jobId} - Job metadata hash
+ * - job:{jobId} - Job metadata hash (for building DispatchFrame)
  * - layers:waiting:{jobId} - Set of layer IDs with waiting frames
  * - frames:waiting:{layerId} - Sorted set of waiting frames
- * - jobs:pending:{showId}:{facilityId} - Set of pending jobs for show
- * - jobs:pending:group:{groupId} - Set of pending jobs for group
  */
 @Repository
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -64,7 +61,6 @@ public class RedisDispatcherDao {
     private final RedisTemplate<String, String> redisTemplate;
     private final RedisScript<List> findDispatchFramesScript;
     private final RedisScript<List> findDispatchFramesByLayerScript;
-    private final RedisScript<List> findJobsByShowScript;
     private final FrameDao frameDao;
 
     // Redis key prefixes
@@ -73,26 +69,17 @@ public class RedisDispatcherDao {
     private static final String FRAME_PREFIX = "frame:";
     private static final String LAYER_PREFIX = "layer:";
     private static final String JOB_PREFIX = "job:";
-    private static final String JOBS_PENDING_PREFIX = "jobs:pending:";
-    private static final String JOBS_PENDING_GROUP_PREFIX = "jobs:pending:group:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
-
-    // Sort modes for job queries
-    public static final int SORT_MODE_BALANCED = 0;
-    public static final int SORT_MODE_PRIORITY = 1;
-    public static final int SORT_MODE_FIFO = 2;
 
     public RedisDispatcherDao(RedisTemplate<String, String> redisTemplate,
                                RedisScript<List> findDispatchFramesScript,
                                RedisScript<List> findDispatchFramesByLayerScript,
-                               RedisScript<List> findJobsByShowScript,
                                FrameDao frameDao) {
         this.redisTemplate = redisTemplate;
         this.findDispatchFramesScript = findDispatchFramesScript;
         this.findDispatchFramesByLayerScript = findDispatchFramesByLayerScript;
-        this.findJobsByShowScript = findJobsByShowScript;
         this.frameDao = frameDao;
-        logger.info("Redis dispatcher DAO initialized (full Redis mode)");
+        logger.info("Redis dispatcher DAO initialized (frame queries only)");
     }
 
     // ============================================================
@@ -251,116 +238,6 @@ public class RedisDispatcherDao {
     }
 
     // ============================================================
-    // JOB DISPATCH METHODS
-    // ============================================================
-
-    /**
-     * Find jobs by show for dispatch (BALANCED mode - default).
-     */
-    public List<DispatchJob> findDispatchJobs(ShowInterface show, DispatchHost host, int limit) {
-        return findDispatchJobs(show, host, limit, SORT_MODE_BALANCED, false);
-    }
-
-    /**
-     * Find jobs by show for dispatch (BALANCED mode, NO_GPU).
-     */
-    public List<DispatchJob> findDispatchJobsNoGpu(ShowInterface show, DispatchHost host, int limit) {
-        return findDispatchJobs(show, host, limit, SORT_MODE_BALANCED, true);
-    }
-
-    /**
-     * Find jobs by show for dispatch (PRIORITY mode).
-     */
-    public List<DispatchJob> findDispatchJobsPriorityMode(ShowInterface show, DispatchHost host, int limit) {
-        return findDispatchJobs(show, host, limit, SORT_MODE_PRIORITY, false);
-    }
-
-    /**
-     * Find jobs by show for dispatch (FIFO mode).
-     */
-    public List<DispatchJob> findDispatchJobsFifoMode(ShowInterface show, DispatchHost host, int limit) {
-        return findDispatchJobs(show, host, limit, SORT_MODE_FIFO, false);
-    }
-
-    private List<DispatchJob> findDispatchJobs(ShowInterface show, DispatchHost host, int limit, int sortMode, boolean noGpu) {
-        long startTime = System.currentTimeMillis();
-
-        try {
-            String jobsPendingKey = JOBS_PENDING_PREFIX + show.getShowId() + ":" + host.getFacilityId();
-            List<List<Object>> results = executeJobSearch(jobsPendingKey, host, limit, sortMode, noGpu);
-
-            if (results == null || results.isEmpty()) {
-                logger.debug("No eligible jobs found in Redis for show {}", show.getShowId());
-                return Collections.emptyList();
-            }
-
-            List<DispatchJob> jobs = buildDispatchJobsFromResults(results);
-
-            logger.debug("Redis findDispatchJobs (show): found {} jobs in {}ms (zero SQL)",
-                    jobs.size(), System.currentTimeMillis() - startTime);
-
-            return jobs;
-
-        } catch (Exception e) {
-            logger.error("Redis job search failed", e);
-            return Collections.emptyList();
-        }
-    }
-
-    /**
-     * Find jobs by group for dispatch (BALANCED mode - default).
-     */
-    public List<DispatchJob> findDispatchJobs(GroupInterface group, DispatchHost host, int limit) {
-        return findDispatchJobsByGroup(group, host, limit, SORT_MODE_BALANCED, false);
-    }
-
-    /**
-     * Find jobs by group for dispatch (BALANCED mode, NO_GPU).
-     */
-    public List<DispatchJob> findDispatchJobsNoGpu(GroupInterface group, DispatchHost host, int limit) {
-        return findDispatchJobsByGroup(group, host, limit, SORT_MODE_BALANCED, true);
-    }
-
-    /**
-     * Find jobs by group for dispatch (PRIORITY mode).
-     */
-    public List<DispatchJob> findDispatchJobsPriorityMode(GroupInterface group, DispatchHost host, int limit) {
-        return findDispatchJobsByGroup(group, host, limit, SORT_MODE_PRIORITY, false);
-    }
-
-    /**
-     * Find jobs by group for dispatch (FIFO mode).
-     */
-    public List<DispatchJob> findDispatchJobsFifoMode(GroupInterface group, DispatchHost host, int limit) {
-        return findDispatchJobsByGroup(group, host, limit, SORT_MODE_FIFO, false);
-    }
-
-    private List<DispatchJob> findDispatchJobsByGroup(GroupInterface group, DispatchHost host, int limit, int sortMode, boolean noGpu) {
-        long startTime = System.currentTimeMillis();
-
-        try {
-            String jobsPendingKey = JOBS_PENDING_GROUP_PREFIX + group.getGroupId();
-            List<List<Object>> results = executeJobSearch(jobsPendingKey, host, limit, sortMode, noGpu);
-
-            if (results == null || results.isEmpty()) {
-                logger.debug("No eligible jobs found in Redis for group {}", group.getGroupId());
-                return Collections.emptyList();
-            }
-
-            List<DispatchJob> jobs = buildDispatchJobsFromResults(results);
-
-            logger.debug("Redis findDispatchJobs (group): found {} jobs in {}ms (zero SQL)",
-                    jobs.size(), System.currentTimeMillis() - startTime);
-
-            return jobs;
-
-        } catch (Exception e) {
-            logger.error("Redis job search by group failed", e);
-            return Collections.emptyList();
-        }
-    }
-
-    // ============================================================
     // INTERNAL HELPER METHODS
     // ============================================================
 
@@ -438,7 +315,7 @@ public class RedisDispatcherDao {
         frame.minGpuMemory = getLong(layerData, "minGpuMemory", 0);
         frame.setMinMemory(getLong(layerData, "minMemory", 0));
 
-        // Job fields
+        // Job fields (for building complete DispatchFrame)
         frame.show = getString(jobData, "showName");
         frame.shot = getString(jobData, "shot");
         frame.owner = getString(jobData, "owner");
@@ -456,25 +333,6 @@ public class RedisDispatcherDao {
         }
 
         return frame;
-    }
-
-    /**
-     * Build DispatchJob objects from Lua script results.
-     */
-    private List<DispatchJob> buildDispatchJobsFromResults(List<List<Object>> results) {
-        List<DispatchJob> jobs = new ArrayList<>(results.size());
-
-        for (List<Object> row : results) {
-            if (row != null && row.size() >= 3) {
-                DispatchJob job = new DispatchJob();
-                job.id = row.get(0).toString();
-                job.priority = ((Number) row.get(1)).intValue();
-                job.rank = ((Number) row.get(2)).intValue();
-                jobs.add(job);
-            }
-        }
-
-        return jobs;
     }
 
     // Helper methods for safe type conversion
@@ -614,31 +472,8 @@ public class RedisDispatcherDao {
         );
     }
 
-    @SuppressWarnings("unchecked")
-    private List<List<Object>> executeJobSearch(String jobsPendingKey, DispatchHost host, int limit, int sortMode, boolean noGpu) {
-        int threadMode = (host.threadMode == ThreadMode.ALL_VALUE) ? 1 : 0;
-        long currentTime = System.currentTimeMillis() / 1000;
-
-        return redisTemplate.execute(
-                findJobsByShowScript,
-                Collections.singletonList(jobsPendingKey),
-                String.valueOf(host.idleCores),
-                String.valueOf(host.idleMemory),
-                String.valueOf(threadMode),
-                String.valueOf(host.idleGpus),
-                String.valueOf(0), // minGpuMem
-                String.valueOf(host.idleGpuMemory), // maxGpuMem
-                host.tags,
-                host.os,
-                String.valueOf(currentTime),
-                String.valueOf(limit),
-                String.valueOf(sortMode),
-                noGpu ? "1" : "0"
-        );
-    }
-
     /**
-     * Check if Redis has data for a job.
+     * Check if Redis has data for a job (layers with waiting frames).
      */
     public boolean hasJobData(String jobId) {
         try {
