@@ -585,8 +585,10 @@ A render host with 64 cores and 128GB RAM sends a host report.
 | Step | Component | Action |
 |------|-----------|--------|
 | 2.1 | `HostReportHandler.handleHostReport()` | Receives host report via gRPC |
-| 2.2 | `DispatchSupport.findUnderProcedJob()` | Finds jobs for host's show (SQL query) |
+| 2.2 | `DispatchSupport.findDispatchJobs()` | Finds jobs for host's show/facility (SQL query) |
 | 2.3 | `DispatchBookHost.run()` | Starts dispatch loop for each job |
+
+**Note:** `findDispatchJobs` is a simple SQL query returning job IDs - it stays in SQL because it's already fast (index lookup on show/facility).
 
 ### Step 3: Frame Dispatch (per job)
 
