@@ -4,6 +4,14 @@
 
 This document describes the Redis-based scheduling cache implementation for OpenCue's cuebot. The cache accelerates frame dispatch operations by moving hot-path queries from PostgreSQL to Redis.
 
+### Key Design Principles
+
+1. **PostgreSQL is ALWAYS the source of truth.** Redis is a read-only cache for scheduling queries. All writes (frame booking, state changes) go to PostgreSQL first.
+
+2. **Redis failures gracefully fall back to SQL.** If Redis is unavailable, returns empty results, or throws an exception, the system automatically falls back to the original SQL queries. The scheduler continues to work—just slower.
+
+3. **No data loss risk.** Since Redis is only used for read queries (finding frames to dispatch), losing Redis data has zero impact on job integrity. A restart simply re-warms the cache from PostgreSQL.
+
 ## Problem Statement
 
 ### The Bottleneck
