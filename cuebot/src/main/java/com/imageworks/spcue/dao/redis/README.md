@@ -461,6 +461,37 @@ cuebot/src/main/resources/lua/
 
 **Note:** Job finding queries stay in SQL - no Lua script for job finding.
 
+## Benefits to PostgreSQL Performance
+
+Offloading frame dispatch queries to Redis improves SQL efficiency for **all other operations**, not just dispatch.
+
+### Why Frame Dispatch Queries Are Expensive
+
+Frame dispatch queries are:
+- **Frequent** - Every host report triggers them (thousands per minute at scale)
+- **Heavy** - Multiple JOINs across frame, layer, job, and limit tables
+- **Read-heavy** - Scanning many rows to find dispatchable frames
+
+### How Redis Helps SQL
+
+| Benefit | Explanation |
+|---------|-------------|
+| **Reduced lock contention** | Frame dispatch queries compete with writes for row/table locks. Moving them to Redis lets updates (booking, state changes) proceed without waiting. |
+| **Freed connection pool** | Dispatch queries consumed database connections. Now those connections are available for booking, state updates, and other operations. |
+| **Better buffer cache usage** | Heavy dispatch queries pollute PostgreSQL's shared_buffers. With fewer dispatch queries, other operations get more cache hits. |
+| **More I/O bandwidth** | Dispatch queries generate significant disk reads. Reducing them leaves more I/O capacity for writes and other reads. |
+
+### Impact on Other Operations
+
+| Operation | Before Redis | After Redis |
+|-----------|--------------|-------------|
+| Frame booking (write) | Competes with dispatch reads | Less contention |
+| Job state updates | May wait on locks | Faster |
+| Dependency updates | Slowed by I/O contention | More responsive |
+| Statistics queries | Cache misses from dispatch scans | Better cache hits |
+
+The key insight: frame dispatch queries are **read-only** and **cacheable**, making them ideal candidates for Redis. This lets PostgreSQL focus on what it does best: **transactional writes**.
+
 ## Operational Considerations
 
 ### Multiple Cuebots
