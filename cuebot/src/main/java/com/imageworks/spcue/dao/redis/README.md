@@ -189,7 +189,6 @@ Finds pending jobs for a show that match host requirements.
 |-------|---------|
 | `SchedulingEventPublisher` | Interface for publishing events |
 | `RedisSchedulingEventPublisher` | Implementation that publishes Spring events |
-| `NoOpSchedulingEventPublisher` | No-op implementation when Redis is disabled |
 | `RedisSchedulingEventListener` | Listens for events and updates Redis |
 
 ### Event Types
@@ -411,7 +410,6 @@ cuebot/src/main/java/com/imageworks/spcue/dao/redis/
 ├── README.md                        # This documentation
 ├── SchedulingEventPublisher.java    # Event publisher interface
 ├── RedisSchedulingEventPublisher.java # Redis implementation
-├── NoOpSchedulingEventPublisher.java  # No-op for disabled Redis
 ├── RedisSchedulingEventListener.java  # Listens and updates Redis
 ├── FrameStateChangedEvent.java      # Frame state change event
 ├── JobStateChangedEvent.java        # Job state change event
