@@ -97,12 +97,16 @@ public class RedisSchedulingEventListener {
                 // Track that this layer has waiting frames
                 redisTemplate.opsForSet().add(LAYERS_WAITING_PREFIX + jobId, layerId);
 
+                // Create frame metadata hash (only for WAITING frames)
+                createFrameMetadata(event);
+
                 logger.debug("Added frame {} to waiting set {} with score {}",
                         frameId, waitingSetKey, event.getSortScore());
 
             } else if (previousState == FrameState.WAITING) {
-                // Frame left WAITING state - remove from sorted set
+                // Frame left WAITING state - remove from sorted set and delete hash
                 redisTemplate.opsForZSet().remove(waitingSetKey, frameId);
+                redisTemplate.delete(FRAME_PREFIX + frameId);
 
                 // Check if layer still has waiting frames
                 Long waitingCount = redisTemplate.opsForZSet().size(waitingSetKey);
@@ -110,14 +114,11 @@ public class RedisSchedulingEventListener {
                     redisTemplate.opsForSet().remove(LAYERS_WAITING_PREFIX + jobId, layerId);
                 }
 
-                logger.debug("Removed frame {} from waiting set {}", frameId, waitingSetKey);
+                logger.debug("Removed frame {} from waiting set {} and deleted hash", frameId, waitingSetKey);
             }
 
             // Track limit running counts - CRITICAL for 1-to-1 parity with SQL
             updateLimitCounters(layerId, previousState, newState);
-
-            // Update frame metadata hash
-            updateFrameMetadata(event);
 
         } catch (Exception e) {
             logger.error("Failed to sync frame state to Redis: {}", frameId, e);
@@ -245,15 +246,16 @@ public class RedisSchedulingEventListener {
     }
 
     /**
-     * Update frame metadata in Redis hash.
+     * Create frame metadata hash in Redis (only for WAITING frames).
+     * The hash is deleted when frame leaves WAITING state.
      */
-    private void updateFrameMetadata(FrameStateChangedEvent event) {
+    private void createFrameMetadata(FrameStateChangedEvent event) {
         String frameKey = FRAME_PREFIX + event.getFrameId();
 
         Map<String, String> frameData = new HashMap<>();
         frameData.put("layerId", event.getLayerId());
         frameData.put("jobId", event.getJobId());
-        frameData.put("state", event.getNewState().toString());
+        frameData.put("state", "WAITING");
         frameData.put("dispatchOrder", String.valueOf(event.getDispatchOrder()));
         frameData.put("layerOrder", String.valueOf(event.getLayerOrder()));
         // Additional DispatchFrame fields
