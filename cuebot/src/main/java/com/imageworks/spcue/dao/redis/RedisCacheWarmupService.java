@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.annotation.PostConstruct;
 
@@ -61,11 +62,23 @@ public class RedisCacheWarmupService {
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
+    // Flag to indicate warmup is complete - scheduling should wait for this
+    private final AtomicBoolean ready = new AtomicBoolean(false);
+
     @Autowired
     public RedisCacheWarmupService(RedisTemplate<String, String> redisTemplate,
                                     JdbcTemplate jdbcTemplate) {
         this.redisTemplate = redisTemplate;
         this.jdbcTemplate = jdbcTemplate;
+    }
+
+    /**
+     * Check if Redis cache is warmed up and ready for scheduling.
+     * RedisDispatchSupport should check this before using Redis.
+     * If not ready, fall back to SQL to ensure correct scheduling.
+     */
+    public boolean isReady() {
+        return ready.get();
     }
 
     /**
@@ -114,9 +127,13 @@ public class RedisCacheWarmupService {
             logger.info("Redis cache warm-up completed in {}ms: {} jobs, {} layers, {} frames, {} limits",
                     duration, jobCount, layerCount, frameCount, limitCount);
 
+            // Mark ready - scheduling can now use Redis
+            ready.set(true);
+            logger.info("Redis scheduling cache is now READY");
+
         } catch (Exception e) {
-            logger.error("Redis cache warm-up failed", e);
-            // Don't throw - the system can still work with SQL fallback
+            logger.error("Redis cache warm-up failed - scheduling will use SQL fallback", e);
+            // Don't set ready - keep using SQL fallback for safety
         }
     }
 
