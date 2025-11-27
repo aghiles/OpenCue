@@ -63,6 +63,7 @@ import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.JobLogUtil;
 import com.imageworks.spcue.util.Convert;
+import com.imageworks.spcue.dao.redis.RedisCacheWarmupService;
 import com.imageworks.spcue.dao.redis.SchedulingEventPublisher;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,6 +85,7 @@ public class JobManagerService implements JobManager {
     private FacilityDao facilityDao;
     private JobLogUtil jobLogUtil;
     private SchedulingEventPublisher schedulingEventPublisher;
+    private RedisCacheWarmupService redisCacheWarmupService;
 
     /**
      * Set the scheduling event publisher for Redis cache synchronization.
@@ -95,6 +97,18 @@ public class JobManagerService implements JobManager {
         if (schedulingEventPublisher != null) {
             logger.info("Scheduling event publisher configured in JobManagerService: {}",
                     schedulingEventPublisher.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Set the Redis cache warmup service for populating new job data.
+     * Autowired with required=false so it works whether Redis is enabled or not.
+     */
+    @Autowired(required = false)
+    public void setRedisCacheWarmupService(RedisCacheWarmupService redisCacheWarmupService) {
+        this.redisCacheWarmupService = redisCacheWarmupService;
+        if (redisCacheWarmupService != null) {
+            logger.info("Redis cache warmup service configured in JobManagerService");
         }
     }
 
@@ -267,6 +281,14 @@ public class JobManagerService implements JobManager {
                     publishJobStateChange(job.detail, group);
                 } catch (Exception e) {
                     logger.warn("Failed to publish job activation for Redis: {}", job.detail.id, e);
+                }
+            }
+            // Warm up Redis cache with layers and frames for this job
+            if (redisCacheWarmupService != null) {
+                try {
+                    redisCacheWarmupService.warmupJob(job.detail.id);
+                } catch (Exception e) {
+                    logger.warn("Failed to warm up Redis cache for job: {}", job.detail.id, e);
                 }
             }
             if (job.getPostJob() != null) {
