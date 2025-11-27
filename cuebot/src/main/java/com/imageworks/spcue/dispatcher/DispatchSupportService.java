@@ -62,6 +62,7 @@ import com.imageworks.spcue.service.DependManager;
 import com.imageworks.spcue.util.FrameSet;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 
 @Transactional(propagation = Propagation.REQUIRED)
 public class DispatchSupportService implements DispatchSupport {
@@ -83,6 +84,31 @@ public class DispatchSupportService implements DispatchSupport {
 
     // Optional Redis dispatch support - null when Redis is disabled
     private RedisDispatchSupport redisDispatchSupport;
+
+    // Environment for reading properties
+    private Environment env;
+
+    @Autowired
+    public void setEnvironment(Environment env) {
+        this.env = env;
+    }
+
+    /**
+     * Get the optimal frame query limit.
+     * When Redis is enabled with smart resource tracking, we use a smaller limit
+     * since Lua returns only frames that will actually fit (no wasted queries).
+     * For SQL, we need a larger limit as a buffer for failed bookings.
+     */
+    private int getOptimalFrameLimit(int requestedLimit) {
+        if (redisDispatchSupport != null && env != null) {
+            // With smart Redis, use the actual booking limit (no need for buffer)
+            int jobFrameDispatchMax = env.getProperty(
+                    "dispatcher.job_frame_dispatch_max", Integer.class, 8);
+            return Math.min(requestedLimit, jobFrameDispatchMax);
+        }
+        // SQL needs larger buffer for failed bookings
+        return requestedLimit;
+    }
 
     /**
      * Set the optional Redis dispatch support.
@@ -135,7 +161,9 @@ public class DispatchSupportService implements DispatchSupport {
             int limit) {
         // Use Redis if available, otherwise fall back to SQL
         if (redisDispatchSupport != null) {
-            return redisDispatchSupport.findNextDispatchFrames(job, proc, limit);
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(job, proc, optimalLimit);
         }
         return dispatcherDao.findNextDispatchFrames(job, proc, limit);
     }
@@ -145,7 +173,9 @@ public class DispatchSupportService implements DispatchSupport {
             int limit) {
         // Use Redis if available, otherwise fall back to SQL
         if (redisDispatchSupport != null) {
-            return redisDispatchSupport.findNextDispatchFrames(job, host, limit);
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(job, host, optimalLimit);
         }
         return dispatcherDao.findNextDispatchFrames(job, host, limit);
     }
@@ -156,7 +186,9 @@ public class DispatchSupportService implements DispatchSupport {
             int limit) {
         // Use Redis if available, otherwise fall back to SQL
         if (redisDispatchSupport != null) {
-            return redisDispatchSupport.findNextDispatchFrames(layer, host, limit);
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(layer, host, optimalLimit);
         }
         return dispatcherDao.findNextDispatchFrames(layer, host, limit);
     }
@@ -167,7 +199,9 @@ public class DispatchSupportService implements DispatchSupport {
             int limit) {
         // Use Redis if available, otherwise fall back to SQL
         if (redisDispatchSupport != null) {
-            return redisDispatchSupport.findNextDispatchFrames(layer, proc, limit);
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(layer, proc, optimalLimit);
         }
         return dispatcherDao.findNextDispatchFrames(layer, proc, limit);
     }
