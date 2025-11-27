@@ -4,6 +4,11 @@
   This Lua script mirrors the SQL query FIND_DISPATCH_FRAME_BY_LAYER_AND_HOST.
   Simpler than the job version - only checks one layer instead of iterating.
 
+  SMART RESOURCE TRACKING:
+  Since all frames in a layer have identical resource requirements, we can
+  calculate exactly how many frames will fit: floor(remaining / required).
+  This returns ONLY frames that will actually fit on the host.
+
   KEYS:
     KEYS[1] = layer:{layerId} - Layer metadata hash
     KEYS[2] = frames:waiting:{layerId} - Sorted set of waiting frame IDs
@@ -34,6 +39,14 @@ local hostTags = ARGV[5]
 local threadMode = tonumber(ARGV[6])
 local limit = tonumber(ARGV[7])
 local noGpu = tonumber(ARGV[8] or 0)
+
+-- Helper to calculate how many frames can fit given remaining resources
+local function calculateMaxFrames(remaining, required)
+    if required <= 0 then
+        return limit  -- No requirement = unlimited (up to limit)
+    end
+    return math.floor(remaining / required)
+end
 
 -- Helper function to check if host tags match layer tags using word boundaries
 -- SQL: host.str_tags ~* ('(?x)' || layer.str_tags || '\y')
@@ -162,5 +175,53 @@ if not resourcesMatch then
     return {}
 end
 
--- Layer matches - return waiting frames ordered by score
-return redis.call('ZRANGE', framesWaitingKey, 0, limit - 1)
+-- Layer matches - calculate how many frames can actually fit
+-- Since all frames in a layer have identical requirements, we calculate:
+-- maxFrames = min(hostCores/minCores, hostMemory/minMemory, ...)
+
+local maxByResources = limit  -- Start with requested limit
+
+-- Calculate max frames by cores
+if minCores > 0 then
+    local maxByCores = calculateMaxFrames(hostCores, minCores)
+    if maxByCores < maxByResources then
+        maxByResources = maxByCores
+    end
+end
+
+-- Calculate max frames by memory
+if minMemory > 0 then
+    local maxByMemory = calculateMaxFrames(hostMemory, minMemory)
+    if maxByMemory < maxByResources then
+        maxByResources = maxByMemory
+    end
+end
+
+-- Calculate max frames by GPUs (if not in noGpu mode)
+if noGpu == 0 then
+    if minGpus > 0 then
+        local maxByGpus = calculateMaxFrames(hostGpus, minGpus)
+        if maxByGpus < maxByResources then
+            maxByResources = maxByGpus
+        end
+    end
+
+    if minGpuMemory > 0 and hostGpuMemory > 0 then
+        local maxByGpuMem = calculateMaxFrames(hostGpuMemory, minGpuMemory)
+        if maxByGpuMem < maxByResources then
+            maxByResources = maxByGpuMem
+        end
+    end
+end
+
+-- Ensure at least 0
+if maxByResources < 0 then
+    maxByResources = 0
+end
+
+-- Return exactly the frames that will fit (no wasted queries)
+if maxByResources == 0 then
+    return {}
+end
+
+return redis.call('ZRANGE', framesWaitingKey, 0, maxByResources - 1)
