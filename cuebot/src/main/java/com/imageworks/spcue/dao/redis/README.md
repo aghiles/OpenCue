@@ -14,6 +14,36 @@ This document describes the Redis-based scheduling cache implementation for Open
 
 4. **Keep it simple.** Only the expensive FRAME dispatch queries use Redis. Job finding queries stay in SQL because they're already fast (simple index lookups returning just job IDs).
 
+### Minimal Surface Area
+
+| What We Cache | What Stays in SQL |
+|---------------|-------------------|
+| `frames:waiting:*` (sorted sets) | Job finding (already fast) |
+| `layer:*` (resource requirements) | Dependencies (state-based) |
+| `job:*` (metadata for DispatchFrame) | Frame booking (writes) |
+| `limit:*` (running counters) | All transactional operations |
+
+### How Dependencies Work
+
+Frame dependencies are **transparent to Redis** because they're handled via state transitions:
+
+```
+Frame with unmet dependency     Frame dependency satisfied
+         │                               │
+         ▼                               ▼
+┌─────────────────┐             ┌─────────────────┐
+│ DEPEND state    │ ──────────▶ │ WAITING state   │
+│ (not in Redis)  │  satisfyDepend()  │ (in Redis)      │
+└─────────────────┘             └─────────────────┘
+```
+
+1. Frames with unmet dependencies stay in `DEPEND` state - **not cached in Redis**
+2. When dependencies are satisfied, `DependManagerService.satisfyDepend()` transitions frame to `WAITING`
+3. The state change fires `FrameStateChangedEvent(DEPEND → WAITING)`
+4. Redis listener adds the frame to `frames:waiting:{layerId}`
+
+This means Redis never needs to know about dependency logic - it just sees frames appear when they become dispatchable.
+
 ## Problem Statement
 
 ### The Bottleneck
