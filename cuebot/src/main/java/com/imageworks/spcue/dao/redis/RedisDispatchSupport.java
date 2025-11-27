@@ -39,9 +39,8 @@ import com.imageworks.spcue.dao.DispatcherDao;
  * Redis-enhanced dispatch support.
  *
  * Provides a Redis-first approach for finding dispatch frames:
- * 1. Wait for cache warmup to complete before using Redis
- * 2. Try Redis for fast frame lookup
- * 3. Fall back to SQL DAO if Redis fails or returns empty results
+ * 1. Try Redis for fast frame lookup
+ * 2. Fall back to SQL DAO if Redis fails or returns empty results
  *
  * This service is only active when redis.scheduling.enabled=true.
  */
@@ -53,24 +52,13 @@ public class RedisDispatchSupport {
 
     private final RedisDispatcherDao redisDispatcherDao;
     private final DispatcherDao sqlDispatcherDao;
-    private final RedisCacheWarmupService warmupService;
 
     @Autowired
     public RedisDispatchSupport(RedisDispatcherDao redisDispatcherDao,
-                                 DispatcherDao sqlDispatcherDao,
-                                 RedisCacheWarmupService warmupService) {
+                                 DispatcherDao sqlDispatcherDao) {
         this.redisDispatcherDao = redisDispatcherDao;
         this.sqlDispatcherDao = sqlDispatcherDao;
-        this.warmupService = warmupService;
         logger.info("Redis dispatch support initialized - Redis-first dispatch enabled");
-    }
-
-    /**
-     * Check if Redis cache is ready for scheduling.
-     * If not ready, callers should fall back to SQL.
-     */
-    public boolean isReady() {
-        return warmupService.isReady();
     }
 
     /**
@@ -82,11 +70,6 @@ public class RedisDispatchSupport {
      * @return List of dispatchable frames
      */
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, DispatchHost host, int limit) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findNextDispatchFrames(job, host, limit);
-        }
-
         long startTime = System.currentTimeMillis();
 
         // Check if Redis has data for this job
@@ -117,11 +100,6 @@ public class RedisDispatchSupport {
      * Find next dispatch frames using VirtualProc.
      */
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, VirtualProc proc, int limit) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findNextDispatchFrames(job, proc, limit);
-        }
-
         long startTime = System.currentTimeMillis();
 
         if (redisDispatcherDao.hasJobData(job.getJobId())) {
@@ -153,11 +131,6 @@ public class RedisDispatchSupport {
      * Find next dispatch frames for a specific layer using Redis with SQL fallback.
      */
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host, int limit) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findNextDispatchFrames(layer, host, limit);
-        }
-
         long startTime = System.currentTimeMillis();
 
         List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, host, limit);
@@ -176,11 +149,6 @@ public class RedisDispatchSupport {
      * Find next dispatch frames for a specific layer using VirtualProc.
      */
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc, int limit) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findNextDispatchFrames(layer, proc, limit);
-        }
-
         long startTime = System.currentTimeMillis();
 
         List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, proc, limit);
@@ -204,11 +172,6 @@ public class RedisDispatchSupport {
      * Returns job IDs for compatibility with existing code.
      */
     public Set<String> findDispatchJobs(DispatchHost host, ShowInterface show, int numJobs) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findDispatchJobs(host, show, numJobs);
-        }
-
         long startTime = System.currentTimeMillis();
 
         List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(show, host, numJobs);
@@ -231,11 +194,6 @@ public class RedisDispatchSupport {
      * Find dispatch jobs for a group using Redis with SQL fallback.
      */
     public Set<String> findDispatchJobs(DispatchHost host, GroupInterface group) {
-        // Don't use Redis until warmup is complete
-        if (!isReady()) {
-            return sqlDispatcherDao.findDispatchJobs(host, group);
-        }
-
         long startTime = System.currentTimeMillis();
 
         List<DispatchJob> jobs = redisDispatcherDao.findDispatchJobs(group, host, 50);
