@@ -219,6 +219,65 @@ public class RedisCacheWarmupService {
     }
 
     /**
+     * Warm up metadata for a single job.
+     * Called when a new job is launched after startup.
+     */
+    private void warmupSingleJobMetadata(String jobId) {
+        String sql = "SELECT j.pk_job, j.pk_show, j.pk_folder, j.pk_facility, " +
+                     "j.str_name, j.str_state, j.b_paused, j.str_os, j.str_shot, j.str_user, j.str_log_dir, " +
+                     "s.str_name AS show_name, " +
+                     "jr.int_priority, jr.int_cores, jr.int_min_cores, jr.int_max_cores, " +
+                     "jr.int_gpus, jr.int_max_gpus, " +
+                     "fr.int_cores AS folder_cores, fr.int_max_cores AS folder_max_cores, " +
+                     "fr.int_gpus AS folder_gpus, fr.int_max_gpus AS folder_max_gpus, " +
+                     "EXTRACT(EPOCH FROM j.ts_updated) AS ts_updated " +
+                     "FROM job j " +
+                     "JOIN show s ON s.pk_show = j.pk_show " +
+                     "JOIN job_resource jr ON jr.pk_job = j.pk_job " +
+                     "JOIN folder_resource fr ON fr.pk_folder = j.pk_folder " +
+                     "WHERE j.pk_job = ?";
+
+        List<Map<String, Object>> jobs = jdbcTemplate.queryForList(sql, jobId);
+
+        if (jobs.isEmpty()) {
+            logger.warn("Job {} not found when warming up metadata", jobId);
+            return;
+        }
+
+        Map<String, Object> row = jobs.get(0);
+        String showId = (String) row.get("pk_show");
+        String facilityId = (String) row.get("pk_facility");
+
+        String jobKey = JOB_PREFIX + jobId;
+        Map<String, String> jobData = new HashMap<>();
+        jobData.put("showId", showId);
+        jobData.put("facilityId", facilityId);
+        jobData.put("folderId", (String) row.get("pk_folder"));
+        jobData.put("state", (String) row.get("str_state"));
+        jobData.put("paused", String.valueOf(row.get("b_paused")));
+        jobData.put("os", nullToEmpty(row.get("str_os")));
+        jobData.put("priority", String.valueOf(row.get("int_priority")));
+        jobData.put("cores", String.valueOf(row.get("int_cores")));
+        jobData.put("minCores", String.valueOf(row.get("int_min_cores")));
+        jobData.put("maxCores", String.valueOf(row.get("int_max_cores")));
+        jobData.put("gpus", String.valueOf(row.get("int_gpus")));
+        jobData.put("maxGpus", String.valueOf(row.get("int_max_gpus")));
+        jobData.put("tsUpdated", String.valueOf(((Number) row.get("ts_updated")).longValue()));
+        jobData.put("folderCores", String.valueOf(row.get("folder_cores")));
+        jobData.put("folderMaxCores", String.valueOf(row.get("folder_max_cores")));
+        jobData.put("folderGpus", String.valueOf(row.get("folder_gpus")));
+        jobData.put("folderMaxGpus", String.valueOf(row.get("folder_max_gpus")));
+        jobData.put("showName", (String) row.get("show_name"));
+        jobData.put("jobName", (String) row.get("str_name"));
+        jobData.put("shot", nullToEmpty(row.get("str_shot")));
+        jobData.put("owner", nullToEmpty(row.get("str_user")));
+        jobData.put("logDir", nullToEmpty(row.get("str_log_dir")));
+
+        redisTemplate.opsForHash().putAll(jobKey, jobData);
+        logger.debug("Warmed up job metadata for {}", jobId);
+    }
+
+    /**
      * Warm up layers for pending jobs.
      */
     private int warmupLayers() {
@@ -368,6 +427,8 @@ public class RedisCacheWarmupService {
         logger.info("Warming up Redis cache for job: {}", jobId);
 
         try {
+            // Populate job metadata hash (needed for building DispatchFrame objects)
+            warmupSingleJobMetadata(jobId);
             int layerCount = warmupJobLayers(jobId);
             int frameCount = warmupJobFrames(jobId);
 
