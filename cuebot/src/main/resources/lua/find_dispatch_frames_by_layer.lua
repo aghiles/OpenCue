@@ -145,13 +145,12 @@ if noGpu == 0 then
         resourcesMatch = false
     end
 
-    -- Check GPU memory
-    if hostGpuMemory > 0 then
-        if minGpuMemory < 1 or minGpuMemory > hostGpuMemory then
+    -- GPU memory check: only reject if layer NEEDS GPU memory
+    -- that exceeds what the host has (or host has none)
+    if minGpuMemory > 0 then
+        if hostGpuMemory == 0 or minGpuMemory > hostGpuMemory then
             resourcesMatch = false
         end
-    elseif minGpuMemory > 0 then
-        resourcesMatch = false
     end
 end
 

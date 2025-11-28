@@ -162,12 +162,12 @@ for _, layerId in ipairs(layerIds) do
                 if minGpus > hostGpus then
                     eligible = false
                 end
-                if hostGpuMemory > 0 then
-                    if minGpuMemory < 1 or minGpuMemory > hostGpuMemory then
+                -- GPU memory check: only reject if layer NEEDS GPU memory
+                -- that exceeds what the host has (or host has none)
+                if minGpuMemory > 0 then
+                    if hostGpuMemory == 0 or minGpuMemory > hostGpuMemory then
                         eligible = false
                     end
-                elseif minGpuMemory > 0 then
-                    eligible = false
                 end
             end
         end
