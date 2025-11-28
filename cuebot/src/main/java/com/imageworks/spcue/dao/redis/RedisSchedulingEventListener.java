@@ -286,8 +286,19 @@ public class RedisSchedulingEventListener {
 
             if (layerIds != null) {
                 for (String layerId : layerIds) {
-                    // Delete waiting frames set for each layer
-                    redisTemplate.delete(FRAMES_WAITING_PREFIX + layerId);
+                    // Get all frame IDs from the waiting set before deleting
+                    String waitingSetKey = FRAMES_WAITING_PREFIX + layerId;
+                    var frameIds = redisTemplate.opsForZSet().range(waitingSetKey, 0, -1);
+
+                    // Delete individual frame hashes
+                    if (frameIds != null) {
+                        for (String frameId : frameIds) {
+                            redisTemplate.delete(FRAME_PREFIX + frameId);
+                        }
+                    }
+
+                    // Delete waiting frames set for this layer
+                    redisTemplate.delete(waitingSetKey);
                     // Delete layer metadata
                     redisTemplate.delete(LAYER_PREFIX + layerId);
                     // Delete layer limits set
