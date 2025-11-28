@@ -31,8 +31,6 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
-import com.imageworks.spcue.JobDetail;
-import com.imageworks.spcue.dao.JobDao;
 import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
@@ -53,24 +51,21 @@ public class RedisCacheWarmupService {
 
     private final RedisTemplate<String, String> redisTemplate;
     private final JdbcTemplate jdbcTemplate;
-    private final JobDao jobDao;
 
     // Redis key prefixes (same as in RedisSchedulingEventListener)
+    // Note: No JOB_PREFIX - job data is cached in-memory by RedisDispatcherDao
     private static final String FRAMES_WAITING_PREFIX = "frames:waiting:";
     private static final String FRAME_PREFIX = "frame:";
     private static final String LAYER_PREFIX = "layer:";
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
-    private static final String JOB_PREFIX = "job:";
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
     @Autowired
     public RedisCacheWarmupService(RedisTemplate<String, String> redisTemplate,
-                                    JdbcTemplate jdbcTemplate,
-                                    JobDao jobDao) {
+                                    JdbcTemplate jdbcTemplate) {
         this.redisTemplate = redisTemplate;
         this.jdbcTemplate = jdbcTemplate;
-        this.jobDao = jobDao;
     }
 
     /**
@@ -85,6 +80,7 @@ public class RedisCacheWarmupService {
 
     /**
      * Main warm-up method - populates Redis from SQL.
+     * Note: Job metadata is cached in-memory by RedisDispatcherDao, not in Redis.
      */
     public void warmupCache() {
         long startTime = System.currentTimeMillis();
@@ -97,10 +93,6 @@ public class RedisCacheWarmupService {
             // Populate limits first (they're referenced by layers)
             int limitCount = warmupLimits();
 
-            // Populate job metadata (needed for building DispatchFrame objects)
-            // Note: Job finding queries stay in SQL - only frame dispatch uses Redis
-            int jobCount = warmupJobMetadata();
-
             // Populate layers and their limits
             int layerCount = warmupLayers();
 
@@ -108,8 +100,8 @@ public class RedisCacheWarmupService {
             int frameCount = warmupWaitingFrames();
 
             long duration = System.currentTimeMillis() - startTime;
-            logger.info("Redis cache warm-up completed in {}ms: {} jobs, {} layers, {} frames, {} limits",
-                    duration, jobCount, layerCount, frameCount, limitCount);
+            logger.info("Redis cache warm-up completed in {}ms: {} layers, {} frames, {} limits",
+                    duration, layerCount, frameCount, limitCount);
 
         } catch (Exception e) {
             logger.error("Redis cache warm-up failed", e);
@@ -124,10 +116,10 @@ public class RedisCacheWarmupService {
     private void clearSchedulingData() {
         logger.info("Clearing existing scheduling data from Redis...");
 
+        // Note: job:* not included - job data is cached in-memory, not Redis
         String[] patterns = {
             "frame:*",
             "layer:*",
-            "job:*",
             "frames:waiting:*",
             "layers:waiting:*",
             "limit:*"
@@ -187,119 +179,6 @@ public class RedisCacheWarmupService {
 
         logger.debug("Warmed up {} limits", count);
         return count;
-    }
-
-    /**
-     * Warm up job metadata for pending jobs.
-     *
-     * Note: Job FINDING queries stay in SQL (they're already fast - simple index lookups).
-     * We only cache job metadata so we can build DispatchFrame objects from Redis frame data.
-     */
-    private int warmupJobMetadata() {
-        String sql = "SELECT j.pk_job, j.pk_show, j.pk_folder, j.pk_facility, " +
-                     "j.str_name, j.str_state, j.b_paused, j.str_os, j.str_shot, j.str_user, j.str_log_dir, " +
-                     "s.str_name AS show_name, " +
-                     "jr.int_priority, jr.int_cores, jr.int_min_cores, jr.int_max_cores, " +
-                     "jr.int_gpus, jr.int_max_gpus, " +
-                     "fr.int_cores AS folder_cores, fr.int_max_cores AS folder_max_cores, " +
-                     "fr.int_gpus AS folder_gpus, fr.int_max_gpus AS folder_max_gpus, " +
-                     "EXTRACT(EPOCH FROM j.ts_updated) AS ts_updated " +
-                     "FROM job j " +
-                     "JOIN show s ON s.pk_show = j.pk_show " +
-                     "JOIN job_resource jr ON jr.pk_job = j.pk_job " +
-                     "JOIN folder_resource fr ON fr.pk_folder = j.pk_folder " +
-                     "WHERE j.str_state = 'PENDING' AND j.b_paused = false";
-
-        List<Map<String, Object>> jobs = jdbcTemplate.queryForList(sql);
-        int count = 0;
-
-        for (Map<String, Object> row : jobs) {
-            String jobId = (String) row.get("pk_job");
-            String showId = (String) row.get("pk_show");
-            String facilityId = (String) row.get("pk_facility");
-
-            // Store job metadata (needed for building DispatchFrame objects)
-            String jobKey = JOB_PREFIX + jobId;
-            Map<String, String> jobData = new HashMap<>();
-            jobData.put("showId", showId);
-            jobData.put("facilityId", facilityId);
-            jobData.put("folderId", (String) row.get("pk_folder"));
-            jobData.put("state", (String) row.get("str_state"));
-            jobData.put("paused", String.valueOf(row.get("b_paused")));
-            jobData.put("os", nullToEmpty(row.get("str_os")));
-            jobData.put("priority", String.valueOf(row.get("int_priority")));
-            jobData.put("cores", String.valueOf(row.get("int_cores")));
-            jobData.put("minCores", String.valueOf(row.get("int_min_cores")));
-            jobData.put("maxCores", String.valueOf(row.get("int_max_cores")));
-            jobData.put("gpus", String.valueOf(row.get("int_gpus")));
-            jobData.put("maxGpus", String.valueOf(row.get("int_max_gpus")));
-            jobData.put("tsUpdated", String.valueOf(((Number) row.get("ts_updated")).longValue()));
-            jobData.put("folderCores", String.valueOf(row.get("folder_cores")));
-            jobData.put("folderMaxCores", String.valueOf(row.get("folder_max_cores")));
-            jobData.put("folderGpus", String.valueOf(row.get("folder_gpus")));
-            jobData.put("folderMaxGpus", String.valueOf(row.get("folder_max_gpus")));
-            jobData.put("showName", (String) row.get("show_name"));
-            jobData.put("jobName", (String) row.get("str_name"));
-            jobData.put("shot", nullToEmpty(row.get("str_shot")));
-            jobData.put("owner", nullToEmpty(row.get("str_user")));
-            jobData.put("logDir", nullToEmpty(row.get("str_log_dir")));
-
-            redisTemplate.opsForHash().putAll(jobKey, jobData);
-            count++;
-        }
-
-        logger.debug("Warmed up {} job metadata entries", count);
-        return count;
-    }
-
-    /**
-     * Warm up metadata for a single job using JobDao.
-     * Called when a new job is launched after startup.
-     * Uses the DAO instead of raw SQL for type safety and maintainability.
-     */
-    private void warmupSingleJobMetadata(String jobId) {
-        JobDetail job = jobDao.getJobDetail(jobId);
-
-        if (job == null) {
-            logger.warn("Job {} not found when warming up metadata", jobId);
-            return;
-        }
-
-        String jobKey = JOB_PREFIX + jobId;
-        Map<String, String> jobData = new HashMap<>();
-
-        // Core identifiers
-        jobData.put("showId", nullToEmpty(job.showId));
-        jobData.put("facilityId", nullToEmpty(job.facilityId));
-        jobData.put("folderId", nullToEmpty(job.groupId));
-
-        // Job state
-        jobData.put("state", job.state != null ? job.state.toString() : "");
-        jobData.put("paused", String.valueOf(job.isPaused));
-
-        // Display/execution info (needed for DispatchFrame)
-        jobData.put("showName", nullToEmpty(job.showName));
-        jobData.put("jobName", nullToEmpty(job.name));
-        jobData.put("shot", nullToEmpty(job.shot));
-        jobData.put("owner", nullToEmpty(job.user));
-        jobData.put("logDir", nullToEmpty(job.logDir));
-        jobData.put("os", nullToEmpty(job.os));
-        jobData.put("lokiURL", nullToEmpty(job.logLokiURL));
-
-        // UID (optional)
-        if (job.uid != null && job.uid.isPresent()) {
-            jobData.put("uid", String.valueOf(job.uid.get()));
-        }
-
-        // Resource constraints
-        jobData.put("priority", String.valueOf(job.priority));
-        jobData.put("minCores", String.valueOf(job.minCoreUnits));
-        jobData.put("maxCores", String.valueOf(job.maxCoreUnits));
-        jobData.put("minGpus", String.valueOf(job.minGpuUnits));
-        jobData.put("maxGpus", String.valueOf(job.maxGpuUnits));
-
-        redisTemplate.opsForHash().putAll(jobKey, jobData);
-        logger.debug("Warmed up job metadata for {}", jobId);
     }
 
     /**
@@ -452,8 +331,7 @@ public class RedisCacheWarmupService {
         logger.info("Warming up Redis cache for job: {}", jobId);
 
         try {
-            // Populate job metadata hash (needed for building DispatchFrame objects)
-            warmupSingleJobMetadata(jobId);
+            // Note: Job metadata is cached in-memory by RedisDispatcherDao, not Redis
             int layerCount = warmupJobLayers(jobId);
             int frameCount = warmupJobFrames(jobId);
 

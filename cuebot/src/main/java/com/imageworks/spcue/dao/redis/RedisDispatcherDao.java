@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -30,17 +31,19 @@ import org.springframework.stereotype.Repository;
 
 import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
+import com.imageworks.spcue.JobDetail;
 import com.imageworks.spcue.JobInterface;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.dao.FrameDao;
+import com.imageworks.spcue.dao.JobDao;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
  * Redis-based dispatcher DAO for fast FRAME lookups.
  *
- * Builds DispatchFrame objects entirely from Redis hashes for ZERO SQL on hot path.
+ * Builds DispatchFrame objects from Redis (frames, layers) + in-memory cache (jobs).
  * Falls back to SQL only if Redis data is missing (cache miss).
  *
  * Job finding queries remain in SQL as they are already fast (simple index lookups).
@@ -48,9 +51,10 @@ import com.imageworks.spcue.grpc.job.FrameState;
  * Redis data structures used:
  * - frame:{frameId} - Frame metadata hash
  * - layer:{layerId} - Layer metadata hash
- * - job:{jobId} - Job metadata hash (for building DispatchFrame)
  * - layers:waiting:{jobId} - Set of layer IDs with waiting frames
  * - frames:waiting:{layerId} - Sorted set of waiting frames
+ *
+ * Job metadata is cached in-memory (not Redis) since it's static for job lifetime.
  */
 @Repository
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
@@ -62,24 +66,29 @@ public class RedisDispatcherDao {
     private final RedisScript<List> findDispatchFramesScript;
     private final RedisScript<List> findDispatchFramesByLayerScript;
     private final FrameDao frameDao;
+    private final JobDao jobDao;
+
+    // In-memory cache for job details (static for job lifetime, no need for Redis)
+    private final ConcurrentHashMap<String, JobDetail> jobDetailCache = new ConcurrentHashMap<>();
 
     // Redis key prefixes
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
     private static final String FRAMES_WAITING_PREFIX = "frames:waiting:";
     private static final String FRAME_PREFIX = "frame:";
     private static final String LAYER_PREFIX = "layer:";
-    private static final String JOB_PREFIX = "job:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
     public RedisDispatcherDao(RedisTemplate<String, String> redisTemplate,
                                RedisScript<List> findDispatchFramesScript,
                                RedisScript<List> findDispatchFramesByLayerScript,
-                               FrameDao frameDao) {
+                               FrameDao frameDao,
+                               JobDao jobDao) {
         this.redisTemplate = redisTemplate;
         this.findDispatchFramesScript = findDispatchFramesScript;
         this.findDispatchFramesByLayerScript = findDispatchFramesByLayerScript;
         this.frameDao = frameDao;
-        logger.info("Redis dispatcher DAO initialized (frame queries only)");
+        this.jobDao = jobDao;
+        logger.info("Redis dispatcher DAO initialized (frame queries only, job cache in-memory)");
     }
 
     // ============================================================
@@ -242,16 +251,50 @@ public class RedisDispatcherDao {
     // ============================================================
 
     /**
-     * Build DispatchFrame objects from Redis hashes.
+     * Get JobDetail from in-memory cache, loading from DB if needed.
+     * Job data is static for job lifetime, so caching in memory is safe.
+     */
+    private JobDetail getJobDetail(String jobId) {
+        return jobDetailCache.computeIfAbsent(jobId, id -> {
+            logger.debug("Loading job {} into in-memory cache", id);
+            return jobDao.getJobDetail(id);
+        });
+    }
+
+    /**
+     * Evict a job from the in-memory cache (called when job completes).
+     */
+    public void evictJobFromCache(String jobId) {
+        jobDetailCache.remove(jobId);
+        logger.debug("Evicted job {} from in-memory cache", jobId);
+    }
+
+    /**
+     * Build DispatchFrame objects from Redis hashes + in-memory job cache.
      */
     private List<DispatchFrame> buildDispatchFramesFromRedis(List<String> frameIds, String jobId) {
         List<DispatchFrame> frames = new ArrayList<>(frameIds.size());
 
-        Map<Object, Object> jobData = redisTemplate.opsForHash().entries(JOB_PREFIX + jobId);
+        // Get job from in-memory cache (not Redis)
+        JobDetail job = getJobDetail(jobId);
+        if (job == null) {
+            logger.warn("Job {} not found, falling back to SQL for all frames", jobId);
+            for (String frameId : frameIds) {
+                try {
+                    DispatchFrame frame = frameDao.getDispatchFrame(frameId);
+                    if (frame != null) {
+                        frames.add(frame);
+                    }
+                } catch (Exception e) {
+                    logger.debug("SQL fallback failed for frame {}: {}", frameId, e.getMessage());
+                }
+            }
+            return frames;
+        }
 
         for (String frameId : frameIds) {
             try {
-                DispatchFrame frame = buildDispatchFrameFromRedis(frameId, jobData);
+                DispatchFrame frame = buildDispatchFrameFromRedis(frameId, job);
                 if (frame != null) {
                     frames.add(frame);
                 }
@@ -273,9 +316,9 @@ public class RedisDispatcherDao {
     }
 
     /**
-     * Build a single DispatchFrame from Redis hashes.
+     * Build a single DispatchFrame from Redis hashes + in-memory job cache.
      */
-    private DispatchFrame buildDispatchFrameFromRedis(String frameId, Map<Object, Object> jobData) {
+    private DispatchFrame buildDispatchFrameFromRedis(String frameId, JobDetail job) {
         Map<Object, Object> frameData = redisTemplate.opsForHash().entries(FRAME_PREFIX + frameId);
         if (frameData == null || frameData.isEmpty()) {
             throw new RuntimeException("Frame data not found in Redis: " + frameId);
@@ -315,22 +358,17 @@ public class RedisDispatcherDao {
         frame.minGpuMemory = getLong(layerData, "minGpuMemory", 0);
         frame.setMinMemory(getLong(layerData, "minMemory", 0));
 
-        // Job fields (for building complete DispatchFrame)
-        frame.show = getString(jobData, "showName");
-        frame.shot = getString(jobData, "shot");
-        frame.owner = getString(jobData, "owner");
-        frame.uid = getOptionalInt(jobData, "uid");
-        frame.logDir = getString(jobData, "logDir");
-        frame.jobName = getString(jobData, "jobName");
-        frame.os = getString(jobData, "os");
-        frame.lokiURL = getString(jobData, "lokiURL");
-
-        if (frame.showId == null) {
-            frame.showId = getString(jobData, "showId");
-        }
-        if (frame.facilityId == null) {
-            frame.facilityId = getString(jobData, "facilityId");
-        }
+        // Job fields from in-memory cache (not Redis)
+        frame.show = job.showName != null ? job.showName : "";
+        frame.shot = job.shot != null ? job.shot : "";
+        frame.owner = job.user != null ? job.user : "";
+        frame.uid = job.uid;
+        frame.logDir = job.logDir != null ? job.logDir : "";
+        frame.jobName = job.name != null ? job.name : "";
+        frame.os = job.os != null ? job.os : "";
+        frame.lokiURL = job.logLokiURL != null ? job.logLokiURL : "";
+        frame.showId = job.showId;
+        frame.facilityId = job.facilityId;
 
         return frame;
     }

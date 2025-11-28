@@ -54,18 +54,21 @@ public class RedisSchedulingEventListener {
     private static final Logger logger = LogManager.getLogger(RedisSchedulingEventListener.class);
 
     private final RedisTemplate<String, String> redisTemplate;
+    private final RedisDispatcherDao redisDispatcherDao;
 
     // Redis key prefixes
+    // Note: No JOB_PREFIX - job data is cached in-memory by RedisDispatcherDao
     private static final String FRAMES_WAITING_PREFIX = "frames:waiting:";
     private static final String FRAME_PREFIX = "frame:";
     private static final String LAYER_PREFIX = "layer:";
     private static final String LAYERS_WAITING_PREFIX = "layers:waiting:";
-    private static final String JOB_PREFIX = "job:";
     private static final String LIMIT_PREFIX = "limit:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
-    public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate) {
+    public RedisSchedulingEventListener(RedisTemplate<String, String> redisTemplate,
+                                        RedisDispatcherDao redisDispatcherDao) {
         this.redisTemplate = redisTemplate;
+        this.redisDispatcherDao = redisDispatcherDao;
         logger.info("Redis scheduling event listener initialized (frame events only)");
     }
 
@@ -314,8 +317,8 @@ public class RedisSchedulingEventListener {
             // Delete the layers waiting set
             redisTemplate.delete(layersWaitingKey);
 
-            // Delete job metadata
-            redisTemplate.delete(JOB_PREFIX + jobId);
+            // Evict job from in-memory cache (not Redis)
+            redisDispatcherDao.evictJobFromCache(jobId);
 
             logger.debug("Cleaned up Redis data for job: {}", jobId);
 
