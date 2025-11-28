@@ -406,7 +406,7 @@ public class RedisDispatcherDao {
                 String.valueOf(host.idleMemory),
                 String.valueOf(host.idleGpus),
                 String.valueOf(host.idleGpuMemory),
-                host.tags,
+                host.tags != null ? host.tags : "",
                 String.valueOf(threadMode),
                 String.valueOf(limit),
                 noGpu ? "1" : "0"
@@ -424,7 +424,7 @@ public class RedisDispatcherDao {
                 String.valueOf(proc.memoryReserved),
                 String.valueOf(proc.gpusReserved),
                 String.valueOf(proc.gpuMemoryReserved),
-                proc.tags,
+                proc.tags != null ? proc.tags : "",
                 "1", // Proc dispatch doesn't check threadable
                 String.valueOf(limit),
                 noGpu ? "1" : "0"
@@ -445,7 +445,7 @@ public class RedisDispatcherDao {
                 String.valueOf(host.idleMemory),
                 String.valueOf(host.idleGpus),
                 String.valueOf(host.idleGpuMemory),
-                host.tags,
+                host.tags != null ? host.tags : "",
                 String.valueOf(threadMode),
                 String.valueOf(limit),
                 noGpu ? "1" : "0"
@@ -465,7 +465,7 @@ public class RedisDispatcherDao {
                 String.valueOf(proc.memoryReserved),
                 String.valueOf(proc.gpusReserved),
                 String.valueOf(proc.gpuMemoryReserved),
-                proc.tags,
+                proc.tags != null ? proc.tags : "",
                 "1", // Proc dispatch doesn't check threadable
                 String.valueOf(limit),
                 noGpu ? "1" : "0"
