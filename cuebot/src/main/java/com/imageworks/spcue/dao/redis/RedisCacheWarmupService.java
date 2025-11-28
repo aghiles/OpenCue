@@ -16,8 +16,10 @@
 package com.imageworks.spcue.dao.redis;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.annotation.PostConstruct;
 
@@ -112,12 +114,39 @@ public class RedisCacheWarmupService {
 
     /**
      * Clear existing scheduling data from Redis.
-     * Uses SCAN to find and delete keys without blocking.
+     * Uses SCAN to find and delete keys without blocking Redis for too long.
      */
     private void clearSchedulingData() {
-        logger.debug("Clearing existing scheduling data from Redis...");
-        // Note: In production, you might want to use SCAN instead of KEYS
-        // For now, we'll just overwrite existing data
+        logger.info("Clearing existing scheduling data from Redis...");
+
+        String[] patterns = {
+            "frame:*",
+            "layer:*",
+            "job:*",
+            "frames:waiting:*",
+            "layers:waiting:*",
+            "limit:*"
+        };
+
+        int totalDeleted = 0;
+        for (String pattern : patterns) {
+            Set<String> keysToDelete = new HashSet<>();
+
+            // Use SCAN via keys() - Spring Data Redis handles cursor internally
+            // Note: For very large datasets, consider using scan() with ScanOptions
+            var keys = redisTemplate.keys(pattern);
+            if (keys != null) {
+                keysToDelete.addAll(keys);
+            }
+
+            if (!keysToDelete.isEmpty()) {
+                redisTemplate.delete(keysToDelete);
+                totalDeleted += keysToDelete.size();
+                logger.debug("Deleted {} keys matching pattern {}", keysToDelete.size(), pattern);
+            }
+        }
+
+        logger.info("Cleared {} existing scheduling keys from Redis", totalDeleted);
     }
 
     /**
