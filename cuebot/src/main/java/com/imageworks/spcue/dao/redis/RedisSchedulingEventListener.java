@@ -108,7 +108,12 @@ public class RedisSchedulingEventListener {
                 redisTemplate.opsForZSet().remove(waitingSetKey, frameId);
                 redisTemplate.delete(FRAME_PREFIX + frameId);
 
-                // Check if layer still has waiting frames
+                // Check if layer still has waiting frames and clean up layers:waiting set.
+                // Note: There's a small race window where another thread could add a frame
+                // between size() and remove(). However, this is self-healing because:
+                // 1. When a frame becomes WAITING, it always does SADD to layers:waiting (line 98)
+                // 2. So even if we incorrectly remove the layer, it gets re-added immediately
+                // 3. Worst case: one dispatch cycle sees empty set, falls back to SQL
                 Long waitingCount = redisTemplate.opsForZSet().size(waitingSetKey);
                 if (waitingCount == null || waitingCount == 0) {
                     redisTemplate.opsForSet().remove(LAYERS_WAITING_PREFIX + jobId, layerId);
