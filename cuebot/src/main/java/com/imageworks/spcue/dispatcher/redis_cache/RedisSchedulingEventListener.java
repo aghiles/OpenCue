@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;

@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -23,6 +23,7 @@ import org.springframework.stereotype.Component;
 
 import com.imageworks.spcue.FrameInterface;
 import com.imageworks.spcue.LayerInterface;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
 import com.imageworks.spcue.grpc.job.FrameState;
 
 /**

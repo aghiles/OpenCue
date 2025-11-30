@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -44,7 +44,7 @@ import com.imageworks.spcue.dao.FrameDao;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 
 @RunWith(MockitoJUnitRunner.class)
-public class RedisDispatcherDaoTest {
+public class RedisDispatchCacheTest {
 
     @Mock
     private RedisTemplate<String, String> redisTemplate;
@@ -67,14 +67,14 @@ public class RedisDispatcherDaoTest {
     @Mock
     private SetOperations<String, String> setOperations;
 
-    private RedisDispatcherDao redisDispatcherDao;
+    private RedisDispatchCache redisDispatchCache;
 
     @Before
     public void setUp() {
         when(redisTemplate.opsForHash()).thenReturn(hashOperations);
         when(redisTemplate.opsForSet()).thenReturn(setOperations);
 
-        redisDispatcherDao = new RedisDispatcherDao(
+        redisDispatchCache = new RedisDispatchCache(
                 redisTemplate,
                 findDispatchFramesScript,
                 findDispatchFramesByLayerScript,
@@ -87,7 +87,7 @@ public class RedisDispatcherDaoTest {
     public void testHasJobData_WithData() {
         when(setOperations.size("layers:waiting:job-123")).thenReturn(3L);
 
-        boolean result = redisDispatcherDao.hasJobData("job-123");
+        boolean result = redisDispatchCache.hasJobData("job-123");
 
         assertTrue(result);
         verify(setOperations).size("layers:waiting:job-123");
@@ -97,7 +97,7 @@ public class RedisDispatcherDaoTest {
     public void testHasJobData_NoData() {
         when(setOperations.size("layers:waiting:job-123")).thenReturn(0L);
 
-        boolean result = redisDispatcherDao.hasJobData("job-123");
+        boolean result = redisDispatchCache.hasJobData("job-123");
 
         assertFalse(result);
     }
@@ -106,7 +106,7 @@ public class RedisDispatcherDaoTest {
     public void testHasJobData_NullSize() {
         when(setOperations.size("layers:waiting:job-123")).thenReturn(null);
 
-        boolean result = redisDispatcherDao.hasJobData("job-123");
+        boolean result = redisDispatchCache.hasJobData("job-123");
 
         assertFalse(result);
     }
@@ -115,7 +115,7 @@ public class RedisDispatcherDaoTest {
     public void testHasJobData_Exception() {
         when(setOperations.size("layers:waiting:job-123")).thenThrow(new RuntimeException("Redis error"));
 
-        boolean result = redisDispatcherDao.hasJobData("job-123");
+        boolean result = redisDispatchCache.hasJobData("job-123");
 
         assertFalse(result);
     }
@@ -141,7 +141,7 @@ public class RedisDispatcherDaoTest {
         when(hashOperations.entries("layer:layer-1")).thenReturn(layerData);
         when(hashOperations.entries("job:job-123")).thenReturn(jobData);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, 10);
 
         assertEquals(2, frames.size());
         assertEquals("frame-1", frames.get(0).id);
@@ -156,7 +156,7 @@ public class RedisDispatcherDaoTest {
         when(redisTemplate.execute(eq(findDispatchFramesScript), anyList(), any()))
                 .thenReturn(Collections.emptyList());
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, 10);
 
         assertTrue(frames.isEmpty());
     }
@@ -169,7 +169,7 @@ public class RedisDispatcherDaoTest {
         when(redisTemplate.execute(eq(findDispatchFramesScript), anyList(), any()))
                 .thenReturn(null);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, 10);
 
         assertTrue(frames.isEmpty());
     }
@@ -191,7 +191,7 @@ public class RedisDispatcherDaoTest {
         when(hashOperations.entries("layer:layer-1")).thenReturn(layerData);
         when(hashOperations.entries("job:job-123")).thenReturn(jobData);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, proc, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, proc, 10);
 
         assertEquals(1, frames.size());
         assertEquals("frame-1", frames.get(0).id);
@@ -214,7 +214,7 @@ public class RedisDispatcherDaoTest {
         when(hashOperations.entries("layer:layer-1")).thenReturn(layerData);
         when(hashOperations.entries("job:job-123")).thenReturn(jobData);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(layer, host, 10);
 
         assertEquals(1, frames.size());
     }
@@ -238,7 +238,7 @@ public class RedisDispatcherDaoTest {
         sqlFrame.id = "frame-missing";
         when(frameDao.getDispatchFrame("frame-missing")).thenReturn(sqlFrame);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, 10);
 
         assertEquals(1, frames.size());
         assertEquals("frame-missing", frames.get(0).id);
@@ -291,7 +291,7 @@ public class RedisDispatcherDaoTest {
         when(hashOperations.entries("layer:layer-1")).thenReturn(layerData);
         when(hashOperations.entries("job:job-123")).thenReturn(jobData);
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, 10);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, 10);
 
         assertEquals(1, frames.size());
         DispatchFrame frame = frames.get(0);

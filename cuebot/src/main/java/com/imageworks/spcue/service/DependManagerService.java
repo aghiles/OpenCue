@@ -54,7 +54,7 @@ import com.imageworks.spcue.depend.LayerOnJob;
 import com.imageworks.spcue.depend.LayerOnLayer;
 import com.imageworks.spcue.depend.LayerOnSimFrame;
 import com.imageworks.spcue.depend.PreviousFrame;
-import com.imageworks.spcue.dao.redis.SchedulingEventPublisher;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
 import com.imageworks.spcue.grpc.depend.DependTarget;
 import com.imageworks.spcue.grpc.depend.DependType;
 import com.imageworks.spcue.grpc.job.FrameState;

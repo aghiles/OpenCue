@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import java.util.Collections;
 import java.util.List;

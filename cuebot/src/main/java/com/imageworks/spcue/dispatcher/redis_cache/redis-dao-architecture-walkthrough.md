@@ -1,4 +1,4 @@
-# Redis DAO Architecture Walkthrough
+# Redis Dispatch Cache Architecture Walkthrough
 
 This document provides a guided tour through the Redis scheduling cache implementation in OpenCue's cuebot.
 
@@ -37,11 +37,11 @@ publishFrameStateChange()  ──────► SchedulingEventPublisher.publis
 
 ### Source Files
 
-1. **[FrameDaoJdbc.java](../postgres/FrameDaoJdbc.java)** (lines 79-83)
+1. **[FrameDaoJdbc.java](../../dao/postgres/FrameDaoJdbc.java)** (lines 79-83)
    - Entry point: `updateFrameState()`, `updateFrameStarted()`, `updateFrameStopped()`
    - Calls `publishFrameStateChange()` after SQL update
 
-2. **[SchedulingEventPublisher.java](SchedulingEventPublisher.java)**
+2. **[SchedulingEventPublisher.java](../../dao/SchedulingEventPublisher.java)**
    - Interface for publishing frame state change events
    - Decouples DAO layer from Redis
 
@@ -155,7 +155,7 @@ CoreUnitDispatcher.dispatchHost()
                     │         redisDispatchSupport.findNextDispatchFrames()
                     │                   │
                     │                   ▼
-                    │         RedisDispatcherDao.findNextDispatchFrames()
+                    │         RedisDispatchCache.findNextDispatchFrames()
                     │                   │
                     │                   ▼
                     │         Execute Lua script (find_dispatch_frames.lua)
@@ -169,33 +169,33 @@ CoreUnitDispatcher.dispatchHost()
 
 ### Source Files
 
-1. **[HostReportHandler.java](../../dispatcher/HostReportHandler.java)**
+1. **[HostReportHandler.java](../HostReportHandler.java)**
    - Entry point for host availability reports
    - Queues dispatch commands to BookingQueue
 
-2. **[CoreUnitDispatcher.java](../../dispatcher/CoreUnitDispatcher.java)** (lines 46-77, 135+)
+2. **[CoreUnitDispatcher.java](../CoreUnitDispatcher.java)** (lines 46-77, 135+)
    - Main dispatcher implementation
    - `dispatchHost()` iterates through jobs and finds frames
 
-3. **[DispatchSupport.java](../../dispatcher/DispatchSupport.java)** (lines 206-237)
+3. **[DispatchSupport.java](../DispatchSupport.java)** (lines 206-237)
    - Interface defining `findNextDispatchFrames()` methods
 
-4. **[DispatchSupportService.java](../../dispatcher/DispatchSupportService.java)** (lines 160-207)
+4. **[DispatchSupportService.java](../DispatchSupportService.java)** (lines 160-207)
    - Routes to Redis or SQL based on configuration
    - `if (redisDispatchSupport != null)` → use Redis, else → use SQL
 
-5. **[RedisDispatcherDao.java](RedisDispatcherDao.java)**
-   - Core Redis dispatch logic
+5. **[RedisDispatchCache.java](RedisDispatchCache.java)**
+   - Core Redis dispatch cache logic
    - `findNextDispatchFrames()` executes Lua script and builds DispatchFrame objects
    - `buildDispatchFramesFromRedis()` constructs full DispatchFrame from Redis hashes (zero SQL)
 
-6. **[find_dispatch_frames.lua](../../../../../resources/lua/find_dispatch_frames.lua)**
+6. **[find_dispatch_frames.lua](../../../resources/lua/find_dispatch_frames.lua)**
    - Atomic Lua script executed in Redis
    - Iterates layers with waiting frames
    - Filters by: tags, cores, memory, GPU memory, limits
    - Returns eligible frame IDs in dispatch order
 
-7. **[find_dispatch_frames_by_layer.lua](../../../../../resources/lua/find_dispatch_frames_by_layer.lua)**
+7. **[find_dispatch_frames_by_layer.lua](../../../resources/lua/find_dispatch_frames_by_layer.lua)**
    - Variant for layer-specific dispatch
 
 ### Lua Script Logic (find_dispatch_frames.lua)

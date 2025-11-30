@@ -52,7 +52,7 @@ import com.imageworks.spcue.grpc.job.LayerType;
 import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.SqlUtil;
-import com.imageworks.spcue.dao.redis.SchedulingEventPublisher;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
 
 import org.springframework.beans.factory.annotation.Autowired;
 

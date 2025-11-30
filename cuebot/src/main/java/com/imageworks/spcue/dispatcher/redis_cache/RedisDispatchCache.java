@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -38,7 +38,7 @@ import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.FrameState;
 
 /**
- * Redis-based dispatcher DAO for fast FRAME lookups.
+ * Redis-based dispatch cache for fast FRAME lookups.
  *
  * Builds DispatchFrame objects entirely from Redis hashes for ZERO SQL on hot path.
  * Falls back to SQL only if Redis data is missing (cache miss).
@@ -54,9 +54,9 @@ import com.imageworks.spcue.grpc.job.FrameState;
  */
 @Repository
 @ConditionalOnProperty(name = "redis.scheduling.enabled", havingValue = "true")
-public class RedisDispatcherDao {
+public class RedisDispatchCache {
 
-    private static final Logger logger = LogManager.getLogger(RedisDispatcherDao.class);
+    private static final Logger logger = LogManager.getLogger(RedisDispatchCache.class);
 
     private final RedisTemplate<String, String> redisTemplate;
     private final RedisScript<List> findDispatchFramesScript;
@@ -71,7 +71,7 @@ public class RedisDispatcherDao {
     private static final String JOB_PREFIX = "job:";
     private static final String LAYER_LIMITS_PREFIX = "layer:limits:";
 
-    public RedisDispatcherDao(RedisTemplate<String, String> redisTemplate,
+    public RedisDispatchCache(RedisTemplate<String, String> redisTemplate,
                                RedisScript<List> findDispatchFramesScript,
                                RedisScript<List> findDispatchFramesByLayerScript,
                                FrameDao frameDao) {

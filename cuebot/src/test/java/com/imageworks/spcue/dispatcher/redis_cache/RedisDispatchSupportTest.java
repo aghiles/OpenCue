@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -45,7 +45,7 @@ import com.imageworks.spcue.dao.DispatcherDao;
 public class RedisDispatchSupportTest {
 
     @Mock
-    private RedisDispatcherDao redisDispatcherDao;
+    private RedisDispatchCache redisDispatchCache;
 
     @Mock
     private DispatcherDao sqlDispatcherDao;
@@ -54,7 +54,7 @@ public class RedisDispatchSupportTest {
 
     @Before
     public void setUp() {
-        redisDispatchSupport = new RedisDispatchSupport(redisDispatcherDao, sqlDispatcherDao);
+        redisDispatchSupport = new RedisDispatchSupport(redisDispatchCache, sqlDispatcherDao);
     }
 
     // ============================================================
@@ -74,8 +74,8 @@ public class RedisDispatchSupportTest {
         DispatchFrame frame2 = new DispatchFrame();
         frame2.id = "frame-2";
 
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(true);
-        when(redisDispatcherDao.findNextDispatchFrames(job, host, 10))
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(true);
+        when(redisDispatchCache.findNextDispatchFrames(job, host, 10))
                 .thenReturn(Arrays.asList(frame1, frame2));
 
         List<DispatchFrame> result = redisDispatchSupport.findNextDispatchFrames(job, host, 10);
@@ -96,8 +96,8 @@ public class RedisDispatchSupportTest {
         DispatchFrame sqlFrame = new DispatchFrame();
         sqlFrame.id = "sql-frame-1";
 
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(true);
-        when(redisDispatcherDao.findNextDispatchFrames(job, host, 10))
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(true);
+        when(redisDispatchCache.findNextDispatchFrames(job, host, 10))
                 .thenReturn(Collections.emptyList());
         when(sqlDispatcherDao.findNextDispatchFrames(job, host, 10))
                 .thenReturn(Arrays.asList(sqlFrame));
@@ -119,7 +119,7 @@ public class RedisDispatchSupportTest {
         DispatchFrame sqlFrame = new DispatchFrame();
         sqlFrame.id = "sql-frame-1";
 
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(false);
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(false);
         when(sqlDispatcherDao.findNextDispatchFrames(job, host, 10))
                 .thenReturn(Arrays.asList(sqlFrame));
 
@@ -127,7 +127,7 @@ public class RedisDispatchSupportTest {
 
         assertEquals(1, result.size());
         assertEquals("sql-frame-1", result.get(0).id);
-        verify(redisDispatcherDao, never()).findNextDispatchFrames(any(JobInterface.class), any(DispatchHost.class), anyInt());
+        verify(redisDispatchCache, never()).findNextDispatchFrames(any(JobInterface.class), any(DispatchHost.class), anyInt());
     }
 
     // ============================================================
@@ -145,8 +145,8 @@ public class RedisDispatchSupportTest {
         DispatchFrame frame1 = new DispatchFrame();
         frame1.id = "frame-1";
 
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(true);
-        when(redisDispatcherDao.findNextDispatchFrames(job, proc, 10))
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(true);
+        when(redisDispatchCache.findNextDispatchFrames(job, proc, 10))
                 .thenReturn(Arrays.asList(frame1));
 
         List<DispatchFrame> result = redisDispatchSupport.findNextDispatchFrames(job, proc, 10);
@@ -166,8 +166,8 @@ public class RedisDispatchSupportTest {
         DispatchFrame sqlFrame = new DispatchFrame();
         sqlFrame.id = "sql-frame-1";
 
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(true);
-        when(redisDispatcherDao.findNextDispatchFrames(job, proc, 10))
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(true);
+        when(redisDispatchCache.findNextDispatchFrames(job, proc, 10))
                 .thenReturn(Collections.emptyList());
         when(sqlDispatcherDao.findNextDispatchFrames(job, proc, 10))
                 .thenReturn(Arrays.asList(sqlFrame));
@@ -190,7 +190,7 @@ public class RedisDispatchSupportTest {
         DispatchFrame frame1 = new DispatchFrame();
         frame1.id = "frame-1";
 
-        when(redisDispatcherDao.findNextDispatchFrames(layer, host, 10))
+        when(redisDispatchCache.findNextDispatchFrames(layer, host, 10))
                 .thenReturn(Arrays.asList(frame1));
 
         List<DispatchFrame> result = redisDispatchSupport.findNextDispatchFrames(layer, host, 10);
@@ -208,7 +208,7 @@ public class RedisDispatchSupportTest {
         DispatchFrame sqlFrame = new DispatchFrame();
         sqlFrame.id = "sql-frame-1";
 
-        when(redisDispatcherDao.findNextDispatchFrames(layer, host, 10))
+        when(redisDispatchCache.findNextDispatchFrames(layer, host, 10))
                 .thenReturn(Collections.emptyList());
         when(sqlDispatcherDao.findNextDispatchFrames(layer, host, 10))
                 .thenReturn(Arrays.asList(sqlFrame));
@@ -227,7 +227,7 @@ public class RedisDispatchSupportTest {
         DispatchFrame frame1 = new DispatchFrame();
         frame1.id = "frame-1";
 
-        when(redisDispatcherDao.findNextDispatchFrames(layer, proc, 10))
+        when(redisDispatchCache.findNextDispatchFrames(layer, proc, 10))
                 .thenReturn(Arrays.asList(frame1));
 
         List<DispatchFrame> result = redisDispatchSupport.findNextDispatchFrames(layer, proc, 10);
@@ -250,7 +250,7 @@ public class RedisDispatchSupportTest {
         DispatchJob job2 = new DispatchJob();
         job2.id = "job-2";
 
-        when(redisDispatcherDao.findDispatchJobs(show, host, 10))
+        when(redisDispatchCache.findDispatchJobs(show, host, 10))
                 .thenReturn(Arrays.asList(job1, job2));
 
         Set<String> result = redisDispatchSupport.findDispatchJobs(host, show, 10);
@@ -268,7 +268,7 @@ public class RedisDispatchSupportTest {
 
         Set<String> sqlJobs = new HashSet<>(Arrays.asList("sql-job-1", "sql-job-2"));
 
-        when(redisDispatcherDao.findDispatchJobs(show, host, 10))
+        when(redisDispatchCache.findDispatchJobs(show, host, 10))
                 .thenReturn(Collections.emptyList());
         when(sqlDispatcherDao.findDispatchJobs(host, show, 10))
                 .thenReturn(sqlJobs);
@@ -292,7 +292,7 @@ public class RedisDispatchSupportTest {
         DispatchJob job1 = new DispatchJob();
         job1.id = "job-1";
 
-        when(redisDispatcherDao.findDispatchJobs(group, host, 50))
+        when(redisDispatchCache.findDispatchJobs(group, host, 50))
                 .thenReturn(Arrays.asList(job1));
 
         Set<String> result = redisDispatchSupport.findDispatchJobs(host, group);
@@ -309,7 +309,7 @@ public class RedisDispatchSupportTest {
 
         Set<String> sqlJobs = new HashSet<>(Arrays.asList("sql-job-1"));
 
-        when(redisDispatcherDao.findDispatchJobs(group, host, 50))
+        when(redisDispatchCache.findDispatchJobs(group, host, 50))
                 .thenReturn(Collections.emptyList());
         when(sqlDispatcherDao.findDispatchJobs(host, group))
                 .thenReturn(sqlJobs);
@@ -326,8 +326,8 @@ public class RedisDispatchSupportTest {
 
     @Test
     public void testIsRedisAvailableForJob() {
-        when(redisDispatcherDao.hasJobData("job-123")).thenReturn(true);
-        when(redisDispatcherDao.hasJobData("job-456")).thenReturn(false);
+        when(redisDispatchCache.hasJobData("job-123")).thenReturn(true);
+        when(redisDispatchCache.hasJobData("job-456")).thenReturn(false);
 
         assertTrue(redisDispatchSupport.isRedisAvailableForJob("job-123"));
         assertFalse(redisDispatchSupport.isRedisAvailableForJob("job-456"));

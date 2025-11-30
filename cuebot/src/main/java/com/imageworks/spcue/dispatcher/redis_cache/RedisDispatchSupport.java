@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dispatcher.redis_cache;
 
 import java.util.List;
 
@@ -48,13 +48,13 @@ public class RedisDispatchSupport {
 
     private static final Logger logger = LogManager.getLogger(RedisDispatchSupport.class);
 
-    private final RedisDispatcherDao redisDispatcherDao;
+    private final RedisDispatchCache redisDispatchCache;
     private final DispatcherDao sqlDispatcherDao;
 
     @Autowired
-    public RedisDispatchSupport(RedisDispatcherDao redisDispatcherDao,
+    public RedisDispatchSupport(RedisDispatchCache redisDispatchCache,
                                  DispatcherDao sqlDispatcherDao) {
-        this.redisDispatcherDao = redisDispatcherDao;
+        this.redisDispatchCache = redisDispatchCache;
         this.sqlDispatcherDao = sqlDispatcherDao;
         logger.info("Redis dispatch support initialized - Redis-first frame dispatch enabled");
     }
@@ -71,8 +71,8 @@ public class RedisDispatchSupport {
         long startTime = System.currentTimeMillis();
 
         // Check if Redis has data for this job
-        if (redisDispatcherDao.hasJobData(job.getJobId())) {
-            List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, host, limit);
+        if (redisDispatchCache.hasJobData(job.getJobId())) {
+            List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, host, limit);
 
             if (!frames.isEmpty()) {
                 logger.debug("Redis dispatch: found {} frames for job {} in {}ms",
@@ -100,8 +100,8 @@ public class RedisDispatchSupport {
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, VirtualProc proc, int limit) {
         long startTime = System.currentTimeMillis();
 
-        if (redisDispatcherDao.hasJobData(job.getJobId())) {
-            List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(job, proc, limit);
+        if (redisDispatchCache.hasJobData(job.getJobId())) {
+            List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(job, proc, limit);
 
             if (!frames.isEmpty()) {
                 logger.debug("Redis dispatch (proc): found {} frames in {}ms",
@@ -118,7 +118,7 @@ public class RedisDispatchSupport {
      * Check if Redis dispatch is available for a job.
      */
     public boolean isRedisAvailableForJob(String jobId) {
-        return redisDispatcherDao.hasJobData(jobId);
+        return redisDispatchCache.hasJobData(jobId);
     }
 
     // ============================================================
@@ -131,7 +131,7 @@ public class RedisDispatchSupport {
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host, int limit) {
         long startTime = System.currentTimeMillis();
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, host, limit);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(layer, host, limit);
 
         if (!frames.isEmpty()) {
             logger.debug("Redis dispatch (layer): found {} frames in {}ms",
@@ -149,7 +149,7 @@ public class RedisDispatchSupport {
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc, int limit) {
         long startTime = System.currentTimeMillis();
 
-        List<DispatchFrame> frames = redisDispatcherDao.findNextDispatchFrames(layer, proc, limit);
+        List<DispatchFrame> frames = redisDispatchCache.findNextDispatchFrames(layer, proc, limit);
 
         if (!frames.isEmpty()) {
             logger.debug("Redis dispatch (layer+proc): found {} frames in {}ms",

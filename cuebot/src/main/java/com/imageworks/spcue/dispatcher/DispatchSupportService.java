@@ -51,7 +51,7 @@ import com.imageworks.spcue.dao.LayerDao;
 import com.imageworks.spcue.dao.ProcDao;
 import com.imageworks.spcue.dao.ShowDao;
 import com.imageworks.spcue.dao.SubscriptionDao;
-import com.imageworks.spcue.dao.redis.RedisDispatchSupport;
+import com.imageworks.spcue.dispatcher.redis_cache.RedisDispatchSupport;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.CheckpointState;
 import com.imageworks.spcue.grpc.job.FrameState;

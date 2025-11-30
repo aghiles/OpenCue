@@ -63,8 +63,8 @@ import com.imageworks.spcue.util.CueUtil;
 import com.imageworks.spcue.util.FrameSet;
 import com.imageworks.spcue.util.JobLogUtil;
 import com.imageworks.spcue.util.Convert;
-import com.imageworks.spcue.dao.redis.RedisCacheWarmupService;
-import com.imageworks.spcue.dao.redis.SchedulingEventPublisher;
+import com.imageworks.spcue.dao.SchedulingEventPublisher;
+import com.imageworks.spcue.dispatcher.redis_cache.RedisCacheWarmupService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 

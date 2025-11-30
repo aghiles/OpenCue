@@ -13,7 +13,7 @@
  * the License.
  */
 
-package com.imageworks.spcue.dao.redis;
+package com.imageworks.spcue.dao;
 
 import com.imageworks.spcue.FrameInterface;
 import com.imageworks.spcue.LayerInterface;
