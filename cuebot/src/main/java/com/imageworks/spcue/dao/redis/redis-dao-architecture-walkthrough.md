@@ -37,21 +37,21 @@ publishFrameStateChange()  ──────► SchedulingEventPublisher.publis
 
 ### Source Files
 
-1. **[FrameDaoJdbc.java](../cuebot/src/main/java/com/imageworks/spcue/dao/postgres/FrameDaoJdbc.java)** (lines 79-83)
+1. **[FrameDaoJdbc.java](../postgres/FrameDaoJdbc.java)** (lines 79-83)
    - Entry point: `updateFrameState()`, `updateFrameStarted()`, `updateFrameStopped()`
    - Calls `publishFrameStateChange()` after SQL update
 
-2. **[SchedulingEventPublisher.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/SchedulingEventPublisher.java)**
+2. **[SchedulingEventPublisher.java](SchedulingEventPublisher.java)**
    - Interface for publishing frame state change events
    - Decouples DAO layer from Redis
 
-3. **[RedisSchedulingEventPublisher.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/RedisSchedulingEventPublisher.java)**
+3. **[RedisSchedulingEventPublisher.java](RedisSchedulingEventPublisher.java)**
    - Creates `FrameStateChangedEvent` and publishes via Spring's `ApplicationEventPublisher`
 
-4. **[FrameStateChangedEvent.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/FrameStateChangedEvent.java)**
+4. **[FrameStateChangedEvent.java](FrameStateChangedEvent.java)**
    - Event payload containing: frameId, layerId, jobId, previousState, newState, dispatchOrder, layerOrder
 
-5. **[RedisSchedulingEventListener.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/RedisSchedulingEventListener.java)** (lines 79-132)
+5. **[RedisSchedulingEventListener.java](RedisSchedulingEventListener.java)** (lines 79-132)
    - `@TransactionalEventListener(AFTER_COMMIT)` ensures Redis sync only after SQL commits
    - `@Async("redisAsyncExecutor")` makes Redis operations non-blocking
    - Handles:
@@ -97,15 +97,15 @@ JobManagerService.launchJobSpec()
 
 ### Source Files
 
-1. **[JobLauncher.java](../cuebot/src/main/java/com/imageworks/spcue/service/JobLauncher.java)** (lines 76-93)
+1. **[JobLauncher.java](../../service/JobLauncher.java)** (lines 76-93)
    - Entry point: `launch(JobSpec)` or `launch(String xml)`
    - Parses job specification and delegates to JobManager
 
-2. **[JobManagerService.java](../cuebot/src/main/java/com/imageworks/spcue/service/JobManagerService.java)** (lines 202-244)
+2. **[JobManagerService.java](../../service/JobManagerService.java)** (lines 202-244)
    - `launchJobSpec()` creates the job in SQL
    - Calls `redisCacheWarmupService.warmupJob()` after job is created
 
-3. **[RedisCacheWarmupService.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/RedisCacheWarmupService.java)**
+3. **[RedisCacheWarmupService.java](RedisCacheWarmupService.java)**
    - **Startup warmup** (lines 80-118): `warmupCache()` runs at `@PostConstruct`, bulk-loads all pending jobs
    - **Single job warmup** (lines 450-468): `warmupJob(jobId)` for newly launched jobs
    - Uses `JobDao.getJobDetail()` for type-safe job data retrieval (lines 260-303)
@@ -169,33 +169,33 @@ CoreUnitDispatcher.dispatchHost()
 
 ### Source Files
 
-1. **[HostReportHandler.java](../cuebot/src/main/java/com/imageworks/spcue/dispatcher/HostReportHandler.java)**
+1. **[HostReportHandler.java](../../dispatcher/HostReportHandler.java)**
    - Entry point for host availability reports
    - Queues dispatch commands to BookingQueue
 
-2. **[CoreUnitDispatcher.java](../cuebot/src/main/java/com/imageworks/spcue/dispatcher/CoreUnitDispatcher.java)** (lines 46-77, 135+)
+2. **[CoreUnitDispatcher.java](../../dispatcher/CoreUnitDispatcher.java)** (lines 46-77, 135+)
    - Main dispatcher implementation
    - `dispatchHost()` iterates through jobs and finds frames
 
-3. **[DispatchSupport.java](../cuebot/src/main/java/com/imageworks/spcue/dispatcher/DispatchSupport.java)** (lines 206-237)
+3. **[DispatchSupport.java](../../dispatcher/DispatchSupport.java)** (lines 206-237)
    - Interface defining `findNextDispatchFrames()` methods
 
-4. **[DispatchSupportService.java](../cuebot/src/main/java/com/imageworks/spcue/dispatcher/DispatchSupportService.java)** (lines 160-207)
+4. **[DispatchSupportService.java](../../dispatcher/DispatchSupportService.java)** (lines 160-207)
    - Routes to Redis or SQL based on configuration
    - `if (redisDispatchSupport != null)` → use Redis, else → use SQL
 
-5. **[RedisDispatcherDao.java](../cuebot/src/main/java/com/imageworks/spcue/dao/redis/RedisDispatcherDao.java)**
+5. **[RedisDispatcherDao.java](RedisDispatcherDao.java)**
    - Core Redis dispatch logic
    - `findNextDispatchFrames()` executes Lua script and builds DispatchFrame objects
    - `buildDispatchFramesFromRedis()` constructs full DispatchFrame from Redis hashes (zero SQL)
 
-6. **[find_dispatch_frames.lua](../cuebot/src/main/resources/lua/find_dispatch_frames.lua)**
+6. **[find_dispatch_frames.lua](../../../../../resources/lua/find_dispatch_frames.lua)**
    - Atomic Lua script executed in Redis
    - Iterates layers with waiting frames
    - Filters by: tags, cores, memory, GPU memory, limits
    - Returns eligible frame IDs in dispatch order
 
-7. **[find_dispatch_frames_by_layer.lua](../cuebot/src/main/resources/lua/find_dispatch_frames_by_layer.lua)**
+7. **[find_dispatch_frames_by_layer.lua](../../../../../resources/lua/find_dispatch_frames_by_layer.lua)**
    - Variant for layer-specific dispatch
 
 ### Lua Script Logic (find_dispatch_frames.lua)
