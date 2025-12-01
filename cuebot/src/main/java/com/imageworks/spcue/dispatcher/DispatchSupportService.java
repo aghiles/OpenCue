@@ -51,6 +51,7 @@ import com.imageworks.spcue.dao.LayerDao;
 import com.imageworks.spcue.dao.ProcDao;
 import com.imageworks.spcue.dao.ShowDao;
 import com.imageworks.spcue.dao.SubscriptionDao;
+import com.imageworks.spcue.dispatcher.redis_cache.RedisDispatchSupport;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.grpc.job.CheckpointState;
 import com.imageworks.spcue.grpc.job.FrameState;
@@ -59,6 +60,9 @@ import com.imageworks.spcue.rqd.RqdClient;
 import com.imageworks.spcue.service.BookingManager;
 import com.imageworks.spcue.service.DependManager;
 import com.imageworks.spcue.util.FrameSet;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 
 @Transactional(propagation = Propagation.REQUIRED)
 public class DispatchSupportService implements DispatchSupport {
@@ -77,6 +81,46 @@ public class DispatchSupportService implements DispatchSupport {
     private RedirectManager redirectManager;
     private BookingManager bookingManager;
     private BookingDao bookingDao;
+
+    // Optional Redis dispatch support - null when Redis is disabled
+    private RedisDispatchSupport redisDispatchSupport;
+
+    // Environment for reading properties
+    private Environment env;
+
+    @Autowired
+    public void setEnvironment(Environment env) {
+        this.env = env;
+    }
+
+    /**
+     * Get the optimal frame query limit.
+     * When Redis is enabled with smart resource tracking, we use a smaller limit
+     * since Lua returns only frames that will actually fit (no wasted queries).
+     * For SQL, we need a larger limit as a buffer for failed bookings.
+     */
+    private int getOptimalFrameLimit(int requestedLimit) {
+        if (redisDispatchSupport != null && env != null) {
+            // With smart Redis, use the actual booking limit (no need for buffer)
+            int jobFrameDispatchMax = env.getProperty(
+                    "dispatcher.job_frame_dispatch_max", Integer.class, 8);
+            return Math.min(requestedLimit, jobFrameDispatchMax);
+        }
+        // SQL needs larger buffer for failed bookings
+        return requestedLimit;
+    }
+
+    /**
+     * Set the optional Redis dispatch support.
+     * When Redis is enabled, this provides faster frame lookups.
+     */
+    @Autowired(required = false)
+    public void setRedisDispatchSupport(RedisDispatchSupport redisDispatchSupport) {
+        this.redisDispatchSupport = redisDispatchSupport;
+        if (redisDispatchSupport != null) {
+            logger.info("Redis dispatch support enabled for faster frame lookups");
+        }
+    }
 
     private ConcurrentHashMap<String, StrandedCores> strandedCores =
             new ConcurrentHashMap<String, StrandedCores>();
@@ -115,12 +159,24 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, VirtualProc proc,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(job, proc, optimalLimit);
+        }
         return dispatcherDao.findNextDispatchFrames(job, proc, limit);
     }
 
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(JobInterface job, DispatchHost host,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(job, host, optimalLimit);
+        }
         return dispatcherDao.findNextDispatchFrames(job, host, limit);
     }
 
@@ -128,6 +184,12 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(layer, host, optimalLimit);
+        }
         return dispatcherDao.findNextDispatchFrames(layer, host, limit);
     }
 
@@ -135,6 +197,12 @@ public class DispatchSupportService implements DispatchSupport {
     @Transactional(readOnly = true)
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, VirtualProc proc,
             int limit) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            // Smart Redis returns only frames that fit - use smaller limit
+            int optimalLimit = getOptimalFrameLimit(limit);
+            return redisDispatchSupport.findNextDispatchFrames(layer, proc, optimalLimit);
+        }
         return dispatcherDao.findNextDispatchFrames(layer, proc, limit);
     }
 
@@ -160,6 +228,10 @@ public class DispatchSupportService implements DispatchSupport {
 
     @Transactional(readOnly = true)
     public Set<String> findDispatchJobs(DispatchHost host, GroupInterface g) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findDispatchJobs(host, g);
+        }
         return dispatcherDao.findDispatchJobs(host, g);
     }
 
@@ -172,6 +244,10 @@ public class DispatchSupportService implements DispatchSupport {
     @Override
     @Transactional(readOnly = true)
     public Set<String> findDispatchJobs(DispatchHost host, ShowInterface show, int numJobs) {
+        // Use Redis if available, otherwise fall back to SQL
+        if (redisDispatchSupport != null) {
+            return redisDispatchSupport.findDispatchJobs(host, show, numJobs);
+        }
         return dispatcherDao.findDispatchJobs(host, show, numJobs);
     }
 

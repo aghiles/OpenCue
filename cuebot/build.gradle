@@ -52,6 +52,10 @@ dependencies {
     implementation group: 'io.prometheus', name: 'simpleclient', version: '0.16.0'
     implementation group: 'io.prometheus', name: 'simpleclient_servlet', version: '0.16.0'
 
+    // Redis for scheduling cache/index
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-data-redis'
+    implementation group: 'org.apache.commons', name: 'commons-pool2', version: '2.11.1'
+
     protobuf files("../proto/src/")
 
     testImplementation group: 'junit', name: 'junit', version: '4.12'
