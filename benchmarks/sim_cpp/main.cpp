@@ -2,7 +2,7 @@
 //
 // CLI entry point. Runs two schedulers side-by-side in parallel threads,
 // prints a comparison report, optionally writes per-tick CSVs. Choose
-// which two via --left and --right (any of legacy, rust, smart).
+// which two via --left and --right (any of legacy, rust, planner).
 
 #include "cluster.hpp"
 #include "workload.hpp"
@@ -31,10 +31,10 @@ struct Args {
     double      tick_seconds       = 1.0;
     double      scale              = 1.0;
     bool        silos              = false;
-    bool        smart_ignore_allocs = false;
-    bool        smart_strict       = false;
-    std::string left               = "legacy";  // legacy | rust | smart
-    std::string right              = "smart";
+    bool        planner_ignore_allocs = false;
+    bool        planner_strict       = false;
+    std::string left               = "legacy";  // legacy | rust | planner
+    std::string right              = "planner";
     std::string left_csv;
     std::string right_csv;
     bool        wide_audit         = false;
@@ -52,10 +52,10 @@ static void usage(const char* argv0) {
         "  --tick-seconds F         simulator tick size [1.0]\n"
         "  --scale F                cluster scale (0.1 = 1/10 hosts) [1.0]\n"
         "  --silos                  3-alloc setup: small/mid/big; Legacy/Rust enforce\n"
-        "  --smart-no-silos         in silos mode, let Smart ignore alloc routing\n"
-        "  --smart-strict           strict reservations, no EASY backfill (production model)\n"
-        "  --left NAME              left column scheduler (legacy|rust|smart) [legacy]\n"
-        "  --right NAME             right column scheduler (legacy|rust|smart) [smart]\n"
+        "  --planner-no-silos         in silos mode, let Planner ignore alloc routing\n"
+        "  --planner-strict           strict reservations, no EASY backfill (production model)\n"
+        "  --left NAME              left column scheduler (legacy|rust|planner) [legacy]\n"
+        "  --right NAME             right column scheduler (legacy|rust|planner) [planner]\n"
         "  --left-csv PATH          write per-tick left-scheduler metrics\n"
         "  --right-csv PATH         write per-tick right-scheduler metrics\n"
         "  --wide-audit             dump per-wide-layer (cores_min>=16) outcome\n"
@@ -90,14 +90,14 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--tick-seconds")       { if (!next(a.tick_seconds)) return false; }
         else if (k == "--scale")              { if (!next(a.scale)) return false; }
         else if (k == "--silos")              { a.silos = true; }
-        else if (k == "--smart-no-silos")     { a.smart_ignore_allocs = true; }
-        else if (k == "--smart-strict")       { a.smart_strict = true; }
+        else if (k == "--planner-no-silos")     { a.planner_ignore_allocs = true; }
+        else if (k == "--planner-strict")       { a.planner_strict = true; }
         // back-compat: --rust swaps Legacy for Rust as left column
         else if (k == "--rust")               { a.left = "rust"; }
         else if (k == "--left")               { if (!next_s(a.left)) return false; }
         else if (k == "--right")              { if (!next_s(a.right)) return false; }
         else if (k == "--legacy-csv")         { if (!next_s(a.left_csv)) return false; }
-        else if (k == "--smart-csv")          { if (!next_s(a.right_csv)) return false; }
+        else if (k == "--planner-csv")          { if (!next_s(a.right_csv)) return false; }
         else if (k == "--left-csv")           { if (!next_s(a.left_csv)) return false; }
         else if (k == "--right-csv")          { if (!next_s(a.right_csv)) return false; }
         else if (k == "--wide-audit")         { a.wide_audit = true; }
@@ -109,10 +109,10 @@ static bool parse_args(int argc, char** argv, Args& a) {
         }
     }
     auto valid = [](const std::string& s) {
-        return s == "legacy" || s == "rust" || s == "smart";
+        return s == "legacy" || s == "rust" || s == "planner";
     };
     if (!valid(a.left) || !valid(a.right)) {
-        std::fprintf(stderr, "--left/--right must be one of: legacy, rust, smart\n");
+        std::fprintf(stderr, "--left/--right must be one of: legacy, rust, planner\n");
         return false;
     }
     return true;
@@ -151,11 +151,11 @@ static void run_named(const std::string& name, const Args& a,
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
         record_ksm(sim);
-    } else {  // smart
-        Simulator<SmartScheduler> sim(std::move(cluster), std::move(arrivals),
-                                       SmartScheduler{}, a.tick_seconds, a.seed + 7);
-        if (a.silos && a.smart_ignore_allocs) sim.scheduler.ignore_allocs = true;
-        if (a.smart_strict)                   sim.scheduler.strict_reservations = true;
+    } else {  // planner
+        Simulator<PlannerScheduler> sim(std::move(cluster), std::move(arrivals),
+                                       PlannerScheduler{}, a.tick_seconds, a.seed + 7);
+        if (a.silos && a.planner_ignore_allocs) sim.scheduler.ignore_allocs = true;
+        if (a.planner_strict)                   sim.scheduler.strict_reservations = true;
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
@@ -166,7 +166,7 @@ static void run_named(const std::string& name, const Args& a,
 static const char* display_name(const std::string& n) {
     if (n == "legacy") return "Legacy";
     if (n == "rust")   return "Rust";
-    return "Smart";
+    return "Planner";
 }
 
 int main(int argc, char** argv) {
@@ -191,8 +191,8 @@ int main(int argc, char** argv) {
                 arrivals.size(),
                 a.hours,
                 a.silos ? "yes" : "no",
-                a.silos && a.smart_ignore_allocs && (a.left == "smart" || a.right == "smart")
-                    ? " (Smart ignores allocs)" : "");
+                a.silos && a.planner_ignore_allocs && (a.left == "planner" || a.right == "planner")
+                    ? " (Planner ignores allocs)" : "");
     std::printf("comparing: %s vs %s\n", display_name(a.left), display_name(a.right));
 
     auto t_start = std::chrono::steady_clock::now();

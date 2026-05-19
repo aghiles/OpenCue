@@ -5,7 +5,7 @@
 //   LegacyScheduler  - per-host greedy first-fit by priority, with optional
 //                      alloc-routing enforcement (silos = true).
 //
-//   SmartScheduler   - spec-group bucketing, stranding-based placementScore,
+//   PlannerScheduler   - spec-group bucketing, stranding-based placementScore,
 //                      priority-keyed persistent reservations with override.
 //                      Mirrors cuebot Scheduler.java.
 //
@@ -289,7 +289,7 @@ class RustScheduler {
 
 
 // ============================================================================
-// Smart: group + stranding score + persistent reservations
+// Planner: group + stranding score + persistent reservations
 // ============================================================================
 
 inline constexpr double W_CORES   = 1.0;
@@ -355,7 +355,7 @@ struct Reservation {
 };
 
 
-class SmartScheduler {
+class PlannerScheduler {
  public:
     int64_t db_ops = 0;  // single-writer (the one thread that owns this scheduler)
 
@@ -432,7 +432,7 @@ class SmartScheduler {
         // ---- 2) group hosts by spec ----------------------------------
         std::unordered_map<HostSpecKey, std::vector<Host*>, HostSpecKeyHash> groups;
         if (ignore_allocs) {
-            // Single bucket regardless of alloc. (Useful for "Smart without silos".)
+            // Single bucket regardless of alloc. (Useful for "Planner without silos".)
             for (auto& h : c.hosts)
                 groups[HostSpecKey{"<unified>", "", "", false}].push_back(&h);
         } else {

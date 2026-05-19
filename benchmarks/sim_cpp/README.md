@@ -16,7 +16,7 @@ For quick algorithmic experiments in a notebook environment use
 ```
 cluster.hpp     Host / Frame / Layer / Job / Show / Cluster
 workload.hpp    Production farm constants + workload generator
-schedulers.hpp  LegacyScheduler + SmartScheduler
+schedulers.hpp  LegacyScheduler + PlannerScheduler
 simulator.hpp   Discrete-time event loop (template on scheduler type)
 report.hpp      Aggregation, percentiles, side-by-side comparison
 main.cpp        CLI entry point; runs both schedulers in parallel threads
@@ -39,8 +39,8 @@ and pthreads. No external dependencies.
 ./sim                                       # 2-hour default sim, full scale
 ./sim --hours 0.5 --scale 0.3               # 30 min, 30% cluster
 ./sim --silos                               # 3-allocation setup, Legacy is constrained
-./sim --silos --smart-no-silos              # Smart treats fleet as unified
-./sim --legacy-csv legacy.csv --smart-csv smart.csv   # per-tick CSVs for plotting
+./sim --silos --planner-no-silos              # Planner treats fleet as unified
+./sim --legacy-csv legacy.csv --planner-csv planner.csv   # per-tick CSVs for plotting
 ```
 
 CLI options:
@@ -55,9 +55,9 @@ CLI options:
 --tick-seconds F       simulator tick size [1.0]
 --scale F              cluster scale (0.1 = 1/10 hosts) [1.0]
 --silos                3-alloc setup; Legacy enforces alloc routing
---smart-no-silos       in silos mode, let Smart treat fleet as one pool
+--planner-no-silos       in silos mode, let Planner treat fleet as one pool
 --legacy-csv PATH      per-tick Legacy metrics
---smart-csv PATH       per-tick Smart metrics
+--planner-csv PATH       per-tick Planner metrics
 ```
 
 ## Silos
@@ -68,10 +68,10 @@ per-host first-fit doesn't fragment big hosts with small frames. `--silos`
 mirrors that: hosts split across three allocs, layers tagged with their
 allowed allocs by frame-size band, and LegacyScheduler enforces the routing.
 
-`--smart-no-silos` is the value-prop: SmartScheduler doesn't *need* the
+`--planner-no-silos` is the value-prop: PlannerScheduler doesn't *need* the
 manual partitioning; you can keep the operational setup (silos in the host
-fleet) and tell Smart to treat everything as one pool. The point is to show
-that Smart removes the operator burden of maintaining alloc routing.
+fleet) and tell Planner to treat everything as one pool. The point is to show
+that Planner removes the operator burden of maintaining alloc routing.
 
 ## Metrics
 
@@ -79,7 +79,7 @@ Output is a side-by-side table on stdout:
 
 ```
 ================================================================================
-METRIC                            Legacy       Smart
+METRIC                            Legacy       Planner
 ================================================================================
 
 --- utilization & fragmentation ---
@@ -118,10 +118,10 @@ sim end, which is the comparison that doesn't lie about throughput.
 
 Each scheduler runs in its own `std::async(std::launch::async)` thread.
 Cluster state is fully owned per-scheduler so there's no contention. The
-elapsed wall time reported is `max(legacy_runtime, smart_runtime)`, since
+elapsed wall time reported is `max(legacy_runtime, planner_runtime)`, since
 the two runs are concurrent.
 
-The SmartScheduler itself is single-threaded inside its tick — that's the
+The PlannerScheduler itself is single-threaded inside its tick — that's the
 algorithm. We do NOT model the production commit pool in the simulator
 (the simulator's commit is the in-memory state change, which is
 instantaneous in C++). For the production timing of the commit pool, see
@@ -147,5 +147,5 @@ Not modeled (intentional, documented):
 - Frame-completion-driven re-dispatch from HostReportHandler
 
 These make Legacy look better than it is in production, so the
-Smart-vs-Legacy delta in the output is a **lower bound** on the real-world
+Planner-vs-Legacy delta in the output is a **lower bound** on the real-world
 improvement.

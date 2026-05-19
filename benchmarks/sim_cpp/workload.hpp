@@ -16,7 +16,7 @@
 //     "big_alloc" (jaime). Each layer's allowed_allocs is set based on
 //     frame size, the way real-world operators manually partition their
 //     farm to make the legacy dispatcher behave. LegacyScheduler enforces
-//     the routing. SmartScheduler ignores it (its win).
+//     the routing. PlannerScheduler ignores it (its win).
 
 #pragma once
 
