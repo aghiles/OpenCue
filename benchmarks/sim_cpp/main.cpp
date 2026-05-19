@@ -32,6 +32,7 @@ struct Args {
     double      scale              = 1.0;
     bool        silos              = false;
     bool        smart_ignore_allocs = false;
+    bool        smart_strict       = false;
     std::string left               = "legacy";  // legacy | rust | smart
     std::string right              = "smart";
     std::string left_csv;
@@ -52,6 +53,7 @@ static void usage(const char* argv0) {
         "  --scale F                cluster scale (0.1 = 1/10 hosts) [1.0]\n"
         "  --silos                  3-alloc setup: small/mid/big; Legacy/Rust enforce\n"
         "  --smart-no-silos         in silos mode, let Smart ignore alloc routing\n"
+        "  --smart-strict           strict reservations, no EASY backfill (production model)\n"
         "  --left NAME              left column scheduler (legacy|rust|smart) [legacy]\n"
         "  --right NAME             right column scheduler (legacy|rust|smart) [smart]\n"
         "  --left-csv PATH          write per-tick left-scheduler metrics\n"
@@ -89,6 +91,7 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--scale")              { if (!next(a.scale)) return false; }
         else if (k == "--silos")              { a.silos = true; }
         else if (k == "--smart-no-silos")     { a.smart_ignore_allocs = true; }
+        else if (k == "--smart-strict")       { a.smart_strict = true; }
         // back-compat: --rust swaps Legacy for Rust as left column
         else if (k == "--rust")               { a.left = "rust"; }
         else if (k == "--left")               { if (!next_s(a.left)) return false; }
@@ -139,6 +142,7 @@ static void run_named(const std::string& name, const Args& a,
         Simulator<SmartScheduler> sim(std::move(cluster), std::move(arrivals),
                                        SmartScheduler{}, a.tick_seconds, a.seed + 7);
         if (a.silos && a.smart_ignore_allocs) sim.scheduler.ignore_allocs = true;
+        if (a.smart_strict)                   sim.scheduler.strict_reservations = true;
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);

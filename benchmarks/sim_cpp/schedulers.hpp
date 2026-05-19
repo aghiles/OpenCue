@@ -305,6 +305,13 @@ class SmartScheduler {
     // spec-key already includes alloc and groups follow.
     bool ignore_allocs = false;
 
+    // Optional: model the production Scheduler.java reservation semantics --
+    // a strict gate with no EASY backfill. With strict_reservations=true,
+    // reservation_allows returns false for any non-mine, non-lower-priority
+    // reservation regardless of frame runtime. Useful for comparing the
+    // capacity cost of strict reservations vs the EASY-backfill variant.
+    bool strict_reservations = false;
+
     int candidates_per_group_max = 2000;
 
     std::unordered_map<std::string, Reservation> reservations;  // host_id -> claim
@@ -528,6 +535,9 @@ class SmartScheduler {
         const auto& r = it->second;
         if (r.layer_id == L.layer_id) return true;
         if (r.priority < priority)    return true;     // override lower priority
+        // strict mode mirrors production Scheduler.java: no EASY backfill,
+        // reserved hosts sit idle until the reserved layer claims them.
+        if (strict_reservations) return false;
         // EASY backfill (Mu'alem & Feitelson 2001): admit a frame onto a
         // reserved host iff the frame will finish before the reservation's
         // PINNED release horizon. release_at was set when the reservation
