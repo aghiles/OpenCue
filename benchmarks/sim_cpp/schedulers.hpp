@@ -284,6 +284,15 @@ inline HostSpecKey spec_key_of(const Host& h) {
 struct Reservation {
     std::string layer_id;
     int         priority;
+    // Time at which the host's existing procs are expected to clear, PINNED
+    // at the moment the reservation is claimed. EASY backfill compares
+    // candidate layer finish times against this fixed horizon. Recomputing
+    // it live from the host's running list lets each backfilled frame
+    // extend the horizon, which admits the next backfill in a livelock-
+    // style failure where the reserved layer never gets the host. The
+    // Mu'alem & Feitelson (2001) EASY invariant requires the reservation's
+    // promised release time to be fixed at claim time.
+    double      release_at;
 };
 
 
@@ -370,19 +379,44 @@ class SmartScheduler {
         for (auto& [spec, hosts] : groups) {
             ++db_ops;  // one "candidate query" per group
 
-            // Build the per-group candidate set: tag/os/alloc + max-total-cores filter.
+            // Build the per-group candidate set. When ignore_allocs=false
+            // the group is homogeneous (same alloc/tags/os) and a single
+            // proto-host check is exact. When ignore_allocs=true the group
+            // is the whole heterogeneous fleet, so the proto-host check is
+            // invalid (e.g. proto is an elk and would falsely reject any
+            // 'highend' layer). In that case admit a layer if SOME host in
+            // the group is compatible; the inner dispatch loop and
+            // pick_target enforce the per-host match.
             int max_cores_total = 0;
             for (Host* h : hosts) max_cores_total = std::max(max_cores_total, h->cores_total);
-            Host* proto = hosts.front();
+
+            auto any_host_compatible = [&](const Layer& L) {
+                for (Host* h : hosts) {
+                    if (!ignore_allocs && !alloc_compatible(L, *h)) continue;
+                    if (!tags_compatible(L, *h))                    continue;
+                    if (!os_compatible(L, *h))                      continue;
+                    return true;
+                }
+                return false;
+            };
 
             std::vector<std::pair<Layer*, Job*>> cands;
             cands.reserve(64);
-            for (auto& [l, j] : all) {
-                if (!ignore_allocs && !alloc_compatible(*l, *proto)) continue;
-                if (!tags_compatible(*l, *proto))                    continue;
-                if (!os_compatible(*l, *proto))                      continue;
-                if (l->cores_min > max_cores_total)                  continue;
-                cands.emplace_back(l, j);
+            if (ignore_allocs) {
+                for (auto& [l, j] : all) {
+                    if (l->cores_min > max_cores_total) continue;
+                    if (!any_host_compatible(*l))      continue;
+                    cands.emplace_back(l, j);
+                }
+            } else {
+                Host* proto = hosts.front();
+                for (auto& [l, j] : all) {
+                    if (!alloc_compatible(*l, *proto)) continue;
+                    if (!tags_compatible(*l, *proto))  continue;
+                    if (!os_compatible(*l, *proto))    continue;
+                    if (l->cores_min > max_cores_total) continue;
+                    cands.emplace_back(l, j);
+                }
             }
             std::sort(cands.begin(), cands.end(), [](const auto& a, const auto& b) {
                 if (a.second->priority != b.second->priority)
@@ -405,6 +439,15 @@ class SmartScheduler {
                     Host* best        = nullptr;
                     double best_score = std::numeric_limits<double>::infinity();
                     for (Host* h : hosts) {
+                        // Per-host tag/os/alloc check: when ignore_allocs=true
+                        // the group is heterogeneous and the per-group
+                        // pre-filter only guarantees SOMEONE matches, not
+                        // every host. Without this we'd happily try to land
+                        // a 'highend' frame on an elk.
+                        if (ignore_allocs) {
+                            if (!tags_compatible(*layer, *h)) continue;
+                            if (!os_compatible(*layer, *h))   continue;
+                        }
                         if (!reservation_allows(*h, *layer, job->priority)) continue;
                         if (!fits_on_host_idle(*layer, *h))                 continue;
                         double s = placement_score(*h, *layer, *job, show);
@@ -427,7 +470,13 @@ class SmartScheduler {
 
                     auto it = reservations.find(best->host_id);
                     if (it != reservations.end() && it->second.priority < job->priority) {
-                        it->second = Reservation{layer->layer_id, job->priority};
+                        // Higher-priority layer just dispatched onto a host that
+                        // was reserved for someone lower-priority: re-claim it
+                        // for ourselves. Use the per-tick cached free time so
+                        // the new horizon excludes the frame we just placed
+                        // (the cache is built once at the top of tick()).
+                        it->second = Reservation{
+                            layer->layer_id, job->priority, predicted_free_time(*best)};
                     }
 
                     if (job->cores_in_use  + layer->cores_min > job->max_cores)   break;
@@ -479,14 +528,14 @@ class SmartScheduler {
         const auto& r = it->second;
         if (r.layer_id == L.layer_id) return true;
         if (r.priority < priority)    return true;     // override lower priority
-        // EASY backfill (Mu'alem & Feitelson 2001): if our frame will be
-        // done before the reservation's host clears its current procs,
-        // we can backfill the otherwise-idle slot without delaying the
-        // reservation. This is what turns wasted-reservation-capacity
-        // back into useful work.
-        double host_clear_at   = predicted_free_time(h);
+        // EASY backfill (Mu'alem & Feitelson 2001): admit a frame onto a
+        // reserved host iff the frame will finish before the reservation's
+        // PINNED release horizon. release_at was set when the reservation
+        // was claimed and does NOT move as new procs land — that's what
+        // stops a stream of small backfills from extending the horizon
+        // indefinitely and starving the reserved layer.
         double layer_finish_at = current_now_ + L.runtime_median_s;
-        return layer_finish_at <= host_clear_at;
+        return layer_finish_at <= r.release_at;
     }
 
     int64_t compute_max_more(const Host& h, const Layer& L, const Job& job, const Show& show) {
@@ -574,7 +623,8 @@ class SmartScheduler {
             for (int k = 0; k < want; ++k) {
                 Host* t = pick_target(L, group_hosts, job);
                 if (!t) break;
-                reservations[t->host_id] = Reservation{L.layer_id, job.priority};
+                reservations[t->host_id] = Reservation{
+                    L.layer_id, job.priority, predicted_free_time(*t)};
             }
         }
     }
@@ -588,6 +638,14 @@ class SmartScheduler {
         Host*  best          = nullptr;
         double best_free_at  = std::numeric_limits<double>::infinity();
         for (Host* h : hosts) {
+            // Same per-host filter rationale as in the dispatch loop: in
+            // ignore_allocs mode the group is heterogeneous so we must
+            // check tags/os per host before considering it as a reservation
+            // target. Otherwise a 'highend' layer could reserve an elk.
+            if (ignore_allocs) {
+                if (!tags_compatible(L, *h)) continue;
+                if (!os_compatible(L, *h))   continue;
+            }
             if (!fits_on_host_total(L, *h))                            continue;
             if (!reservation_allows(*h, L, job.priority))              continue;
             double t = predicted_free_time(*h);
