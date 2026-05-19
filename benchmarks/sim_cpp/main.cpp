@@ -7,6 +7,7 @@
 #include "cluster.hpp"
 #include "workload.hpp"
 #include "schedulers.hpp"
+#include "script.hpp"
 #include "simulator.hpp"
 #include "report.hpp"
 
@@ -33,6 +34,7 @@ struct Args {
     bool        silos              = false;
     bool        planner_ignore_allocs = false;
     bool        planner_strict       = false;
+    bool        script               = false;  // apply cue-layer-man pre-pass to Legacy/Rust
     std::string left               = "legacy";  // legacy | rust | planner
     std::string right              = "planner";
     std::string left_csv;
@@ -54,6 +56,8 @@ static void usage(const char* argv0) {
         "  --silos                  3-alloc setup: small/mid/big; Legacy/Rust enforce\n"
         "  --planner-no-silos         in silos mode, let Planner ignore alloc routing\n"
         "  --planner-strict           strict reservations, no EASY backfill (production model)\n"
+        "  --script                   apply cue-layer-man pre-pass to Legacy/Rust\n"
+        "                             (rewrites cores_min and tags per memory tier; Planner runs without it)\n"
         "  --left NAME              left column scheduler (legacy|rust|planner) [legacy]\n"
         "  --right NAME             right column scheduler (legacy|rust|planner) [planner]\n"
         "  --left-csv PATH          write per-tick left-scheduler metrics\n"
@@ -92,6 +96,7 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--silos")              { a.silos = true; }
         else if (k == "--planner-no-silos")     { a.planner_ignore_allocs = true; }
         else if (k == "--planner-strict")       { a.planner_strict = true; }
+        else if (k == "--script")               { a.script = true; }
         // back-compat: --rust swaps Legacy for Rust as left column
         else if (k == "--rust")               { a.left = "rust"; }
         else if (k == "--left")               { if (!next_s(a.left)) return false; }
@@ -185,20 +190,29 @@ int main(int argc, char** argv) {
     auto    arrivals = generate_arrivals(cfg, cluster_l.total_cores(),
                                           a.seed + 1, a.silos);
 
-    std::printf("hosts=%zu  total_cores=%lld  jobs=%zu  sim=%.2fh  silos=%s%s\n",
+    std::printf("hosts=%zu  total_cores=%lld  jobs=%zu  sim=%.2fh  silos=%s%s%s\n",
                 cluster_l.hosts.size(),
                 (long long)cluster_l.total_cores(),
                 arrivals.size(),
                 a.hours,
                 a.silos ? "yes" : "no",
                 a.silos && a.planner_ignore_allocs && (a.left == "planner" || a.right == "planner")
-                    ? " (Planner ignores allocs)" : "");
+                    ? " (Planner ignores allocs)" : "",
+                a.script ? "  script=on (Legacy/Rust only)" : "");
     std::printf("comparing: %s vs %s\n", display_name(a.left), display_name(a.right));
 
     auto t_start = std::chrono::steady_clock::now();
 
     auto arrivals_l = arrivals;
     auto arrivals_r = std::move(arrivals);
+
+    // Apply the cue-layer-man pre-pass to Legacy/Rust arrivals only.
+    // Planner runs against the unmodified workload because its E-PVM
+    // scoring is what the script approximates by hand.
+    if (a.script) {
+        if (a.left != "planner")  apply_script_to_arrivals(arrivals_l);
+        if (a.right != "planner") apply_script_to_arrivals(arrivals_r);
+    }
 
     RunResult res_l, res_r;
     auto fut_l = std::async(std::launch::async, [&] {
