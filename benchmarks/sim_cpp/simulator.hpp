@@ -133,6 +133,44 @@ class Simulator {
         }
     }
 
+    // Per-(layer, host) dispatch count. Built post-sim from frame.host_id.
+    // Used to score KSM co-location: frames of the same layer running on
+    // the same host share many memory pages (same render binary + similar
+    // working set), so kernel same-page merging (KSM) deduplicates them.
+    // A scheduler that scatters same-layer frames across hosts gets zero
+    // KSM benefit; one that packs them onto the same host saves memory
+    // proportional to (frames_per_layer_per_host - 1).
+ public:
+    struct KsmStats {
+        int64_t total_dispatched   = 0;
+        int64_t co_located_frames  = 0;   // share host with same-layer peer
+        double  avg_per_layer_host = 0.0; // mean frames per (layer, host)
+        int64_t distinct_buckets   = 0;   // count of (layer, host) pairs used
+    };
+
+    KsmStats compute_ksm_stats() const {
+        std::unordered_map<std::string, std::unordered_map<std::string, int>> per_layer;
+        for (const auto& j : cluster.jobs)
+            for (const auto& L : j.layers)
+                for (const auto& f : L.frames)
+                    if (!f.host_id.empty())
+                        ++per_layer[L.layer_id][f.host_id];
+
+        KsmStats s;
+        for (const auto& [layer_id, hosts] : per_layer) {
+            for (const auto& [host_id, n] : hosts) {
+                s.total_dispatched += n;
+                if (n >= 2) s.co_located_frames += n;
+                ++s.distinct_buckets;
+            }
+        }
+        s.avg_per_layer_host = s.distinct_buckets > 0
+            ? double(s.total_dispatched) / double(s.distinct_buckets)
+            : 0.0;
+        return s;
+    }
+
+ private:
     void apply_bookings(const std::vector<Booking>& bookings) {
         for (const auto& b : bookings) {
             Layer* L = layer_of(cluster, *b.frame);

@@ -121,23 +121,36 @@ static bool parse_args(int argc, char** argv, Args& a) {
 struct RunResult {
     std::vector<TickMetrics>                    metrics;
     std::unordered_map<std::string, WaitRecord> waits;
+    int64_t                                     ksm_total      = 0;
+    int64_t                                     ksm_co_located = 0;
+    double                                      ksm_avg_pl_h   = 0.0;
+    int64_t                                     ksm_buckets    = 0;
 };
 
 static void run_named(const std::string& name, const Args& a,
                        Cluster&& cluster, std::vector<Job>&& arrivals,
                        double sim_seconds, RunResult& out) {
+    auto record_ksm = [&](auto& sim) {
+        auto k = sim.compute_ksm_stats();
+        out.ksm_total      = k.total_dispatched;
+        out.ksm_co_located = k.co_located_frames;
+        out.ksm_avg_pl_h   = k.avg_per_layer_host;
+        out.ksm_buckets    = k.distinct_buckets;
+    };
     if (name == "legacy") {
         Simulator<LegacyScheduler> sim(std::move(cluster), std::move(arrivals),
                                         LegacyScheduler{}, a.tick_seconds, a.seed + 7);
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        record_ksm(sim);
     } else if (name == "rust") {
         Simulator<RustScheduler> sim(std::move(cluster), std::move(arrivals),
                                       RustScheduler{}, a.tick_seconds, a.seed + 7);
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        record_ksm(sim);
     } else {  // smart
         Simulator<SmartScheduler> sim(std::move(cluster), std::move(arrivals),
                                        SmartScheduler{}, a.tick_seconds, a.seed + 7);
@@ -146,6 +159,7 @@ static void run_named(const std::string& name, const Args& a,
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        record_ksm(sim);
     }
 }
 
@@ -218,6 +232,21 @@ int main(int argc, char** argv) {
     auto ww_r = wait_stats(waits_r, sim_end, 16);
     print_comparison(display_name(a.left), display_name(a.right),
                       agg_l, agg_r, w_l, w_r, ww_l, ww_r);
+
+    auto ksm_pct = [](int64_t co, int64_t total) {
+        return total > 0 ? 100.0 * double(co) / double(total) : 0.0;
+    };
+    std::printf("\n--- KSM co-location (same-layer frames sharing a host) ---\n");
+    std::printf("%-40s %12s%12s\n", "METRIC", display_name(a.left), display_name(a.right));
+    std::printf("  co-located frames %%                      %10.1f%%  %10.1f%%\n",
+                ksm_pct(res_l.ksm_co_located, res_l.ksm_total),
+                ksm_pct(res_r.ksm_co_located, res_r.ksm_total));
+    std::printf("  avg frames per (layer, host)             %10.2f  %10.2f\n",
+                res_l.ksm_avg_pl_h, res_r.ksm_avg_pl_h);
+    std::printf("  total (layer, host) buckets              %10lld  %10lld\n",
+                (long long)res_l.ksm_buckets, (long long)res_r.ksm_buckets);
+    std::printf("  total dispatched frames                  %10lld  %10lld\n",
+                (long long)res_l.ksm_total, (long long)res_r.ksm_total);
 
     if (!a.left_csv.empty()) {
         write_csv(a.left_csv, res_l.metrics);
