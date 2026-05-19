@@ -6,6 +6,7 @@
 #pragma once
 
 #include "cluster.hpp"
+#include "schedulers.hpp"
 #include "workload.hpp"
 
 #include <random>
@@ -159,9 +160,47 @@ class Simulator {
         m.frames_running     = cluster.running_frame_count();
         m.frames_waiting     = cluster.waiting_frame_count();
         m.bookings_this_tick = bookings_count;
-        m.fragmented_cores   = m.frames_waiting > 0 ? m.cores_idle : 0;
+        m.fragmented_cores   = compute_stranded_cores();
         m.db_ops_cumulative  = scheduler.db_ops;
         metrics.push_back(m);
+    }
+
+    // Stranded cores: idle capacity on hosts that already have >= 1 running
+    // proc, but only counted if there exists a waiting frame that would
+    // have fit on those idle cores (including tag/os/alloc compatibility).
+    //
+    // Unlike the old binary "any waiting frame anywhere -> all idle cores
+    // are fragmented" gate, this measures actual stranding: capacity that
+    // is wasted because the bits don't line up. It doesn't count:
+    //   - idle hosts (those are headroom, not fragmentation),
+    //   - reservations held open for blocked-layer starvation prevention
+    //     (the only waiting frames that would fit there are the reserved
+    //     layer itself; if it doesn't fit yet, no fragmentation),
+    //   - ramp-up idle (no procs running on a host yet -> not stranded).
+    int64_t compute_stranded_cores() {
+        // Gather waiting layers once.
+        std::vector<const Layer*> waiting_layers;
+        for (auto& j : cluster.jobs) {
+            if (j.paused || j.state != "PENDING") continue;
+            for (auto& l : j.layers)
+                if (l.waiting_frame_count() > 0) waiting_layers.push_back(&l);
+        }
+        if (waiting_layers.empty()) return 0;
+
+        double stranded = 0.0;
+        for (auto& h : cluster.hosts) {
+            if (h.running.empty())       continue;   // idle host, not stranded
+            if (h.cores_idle <= 0)       continue;   // host fully packed
+            for (const Layer* L : waiting_layers) {
+                if (!alloc_compatible(*L, h)) continue;
+                if (!tags_compatible(*L, h))  continue;
+                if (!os_compatible(*L, h))    continue;
+                if (!fits_on_host_idle(*L, h)) continue;
+                stranded += h.cores_idle;
+                break;
+            }
+        }
+        return static_cast<int64_t>(stranded);
     }
 };
 
