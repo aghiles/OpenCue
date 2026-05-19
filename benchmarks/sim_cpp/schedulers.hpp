@@ -184,6 +184,14 @@ class RustScheduler {
  public:
     int64_t db_ops = 0;
     bool    core_saturation = true;   // mirrors HostBookingStrategy default
+    // Production caps mirrored from rust/crates/scheduler/src/config/mod.rs:
+    //   dispatch_frames_per_layer_limit = 20  (max frames per dispatch_inner call)
+    //   host_candidate_attempts_per_layer = 10 (max hosts per process_layer call)
+    // The 20-frame cap is what bounds each "batch" placed onto a single host
+    // before the host is checked back into the B-tree and the next CheckOut
+    // is made.
+    int dispatch_frames_per_layer_limit  = 20;
+    int host_candidate_attempts_per_layer = 10;
 
     std::vector<Booking> tick(Cluster& c, double now) {
         (void)now;
@@ -199,9 +207,7 @@ class RustScheduler {
         }
         // Production Rust orders dispatchable jobs by int_priority DESC
         // (see rust/crates/scheduler/src/dao/job_dao.rs ORDER BY clause),
-        // with ts_started as a stable secondary key. Within a job, layers
-        // are dispatched in int_dispatch_order, which the sim approximates
-        // as insertion order from layer_jobs's nested loop above.
+        // with ts_started as a stable secondary key.
         std::sort(layer_jobs.begin(), layer_jobs.end(),
                   [](const auto& a, const auto& b) {
                       if (a.second->priority != b.second->priority)
@@ -209,24 +215,33 @@ class RustScheduler {
                       return a.second->ts_started < b.second->ts_started;
                   });
 
-        for (const auto& [layer, job] : layer_jobs) {
-            Show& show = c.show_of(layer->show_id);
+        // Round-robin between layers, one batch per layer per round, to model
+        // parallel matcher actors (matcher.rs process_layer) competing for the
+        // same B-tree. Without round-robin a single-threaded sim would have
+        // one layer monopolize the least-idle-fits host indefinitely, which
+        // is unrealistic for the production deployment that runs many layers
+        // through process_layer concurrently. Each batch places up to
+        // dispatch_frames_per_layer_limit frames on a single host before the
+        // next layer gets a turn. A layer makes at most
+        // host_candidate_attempts_per_layer batches per tick (matches the
+        // attempts cap inside process_layer).
+        std::unordered_map<Layer*, int> attempts_used;
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (const auto& [layer, job] : layer_jobs) {
+                if (layer->waiting_frame_count() <= 0) continue;
+                if (attempts_used[layer] >= host_candidate_attempts_per_layer) continue;
+                Show& show = c.show_of(layer->show_id);
+                if (job->cores_in_use + layer->cores_min > job->max_cores)   continue;
+                if (show.cores_in_use + layer->cores_min > show.burst_cores) continue;
 
-            while (layer->waiting_frame_count() > 0) {
-                if (job->cores_in_use + layer->cores_min > job->max_cores)   break;
-                if (show.cores_in_use + layer->cores_min > show.burst_cores) break;
-
-                // One scheduler op per booking attempt: the real Rust
-                // dispatcher pulls a single host candidate from the
-                // in-memory host-cache B-tree here. The host scan below
-                // is the in-memory stand-in for the tree walk and is
-                // not charged per host considered.
+                // One scheduler op per process_layer attempt (one B-tree
+                // CheckOut). The host scan below is the in-memory stand-in
+                // for the tree walk and is not charged per host.
                 ++db_ops;
+                ++attempts_used[layer];
 
-                // core_saturation=true (default) packs: pick the host with the
-                // FEWEST idle cores that still fits. The first booking on a
-                // fresh cluster ties (all hosts identical); subsequent bookings
-                // prefer the same host until saturated, then spill to the next.
                 Host* best         = nullptr;
                 double best_cores  = core_saturation
                                        ?  std::numeric_limits<double>::infinity()
@@ -242,19 +257,30 @@ class RustScheduler {
                         if (h.cores_idle > best_cores) { best_cores = h.cores_idle; best = &h; }
                     }
                 }
-                if (!best) break;
+                if (!best) continue;
 
-                Frame* f = layer->next_waiting_frame();
-                if (!f) break;
-                out.push_back({best, f});
-
-                best->cores_idle      -= effective_cores(layer->cores_min);
-                best->mem_idle_kb     -= layer->mem_min_kb;
-                best->gpus_idle       -= layer->gpus_min;
-                best->gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
-                job->cores_in_use     += layer->cores_min;
-                show.cores_in_use     += layer->cores_min;
-                f->state              = FrameState::RUNNING;
+                // Pack up to dispatch_frames_per_layer_limit frames of this
+                // layer onto the selected host. This is the dispatch_inner
+                // frame loop in pipeline/dispatcher/actor.rs:259.
+                int batch_placed = 0;
+                while (batch_placed < dispatch_frames_per_layer_limit
+                       && layer->waiting_frame_count() > 0
+                       && fits_on_host_idle(*layer, *best)
+                       && job->cores_in_use  + layer->cores_min <= job->max_cores
+                       && show.cores_in_use  + layer->cores_min <= show.burst_cores) {
+                    Frame* f = layer->next_waiting_frame();
+                    if (!f) break;
+                    out.push_back({best, f});
+                    best->cores_idle      -= effective_cores(layer->cores_min);
+                    best->mem_idle_kb     -= layer->mem_min_kb;
+                    best->gpus_idle       -= layer->gpus_min;
+                    best->gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
+                    job->cores_in_use     += layer->cores_min;
+                    show.cores_in_use     += layer->cores_min;
+                    f->state              = FrameState::RUNNING;
+                    ++batch_placed;
+                    progress = true;
+                }
             }
         }
         return out;
