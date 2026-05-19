@@ -171,8 +171,15 @@ class RustScheduler {
                     layer_jobs.emplace_back(&l, &j);
             }
         }
+        // Production Rust orders dispatchable jobs by int_priority DESC
+        // (see rust/crates/scheduler/src/dao/job_dao.rs ORDER BY clause),
+        // with ts_started as a stable secondary key. Within a job, layers
+        // are dispatched in int_dispatch_order, which the sim approximates
+        // as insertion order from layer_jobs's nested loop above.
         std::sort(layer_jobs.begin(), layer_jobs.end(),
                   [](const auto& a, const auto& b) {
+                      if (a.second->priority != b.second->priority)
+                          return a.second->priority > b.second->priority;
                       return a.second->ts_started < b.second->ts_started;
                   });
 
