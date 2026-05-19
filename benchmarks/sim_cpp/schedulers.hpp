@@ -77,6 +77,17 @@ class LegacyScheduler {
  public:
     int64_t db_ops = 0;  // single-writer (the one thread that owns this scheduler)
 
+    // Production CoreUnitDispatcher caps per-(host,job) dispatch at
+    // dispatcher.job_frame_dispatch_max (default 8) and total per-host
+    // dispatch at dispatcher.host_frame_dispatch_max (default 12). The
+    // important property for KSM is that ONE call to dispatchHost(host,
+    // job) loops over findNextDispatchFrames(job, host, ...) and books
+    // up to job_frame_dispatch_max frames of the SAME job onto the host
+    // before moving to the next job. Modeling this packing is what
+    // matters for same-host KSM co-location.
+    int job_frame_dispatch_max  = 8;
+    int host_frame_dispatch_max = 12;
+
     std::vector<Booking> tick(Cluster& c, double now) {
         (void)now;
         std::vector<Booking> out;
@@ -98,12 +109,19 @@ class LegacyScheduler {
                       return a.second->ts_started < b.second->ts_started;
                   });
 
-        // For each host, take the first compatible candidate that fits, then
-        // keep going (a host can take more frames if room remains).
+        // For each host, walk the priority-ordered candidate list and dispatch
+        // up to job_frame_dispatch_max frames of the SAME (layer, job) before
+        // moving on. Once the host has booked host_frame_dispatch_max frames
+        // total across any jobs, stop. Mirrors production CoreUnitDispatcher
+        // dispatchHost -> dispatchHost(host, job) -> findNextDispatchFrames
+        // pattern (CoreUnitDispatcher.java:135-321).
         for (auto& h : c.hosts) {
             if (h.cores_idle <= 0) continue;
+            int host_booked = 0;
             for (const auto& [layer, job] : layer_jobs) {
                 ++db_ops;
+                if (host_booked >= host_frame_dispatch_max)        break;
+                if (h.cores_idle <= 0)                              break;
                 if (!alloc_compatible(*layer, h)) continue;
                 if (!tags_compatible(*layer, h))  continue;
                 if (!os_compatible(*layer, h))    continue;
@@ -112,20 +130,28 @@ class LegacyScheduler {
                 Show& show = c.show_of(layer->show_id);
                 if (show.cores_in_use + layer->cores_min > show.burst_cores) continue;
 
-                Frame* f = layer->next_waiting_frame();
-                if (!f) continue;
-                out.push_back({&h, f});
-
-                // Decrement in-memory so subsequent iterations on this host see it.
-                h.cores_idle      -= effective_cores(layer->cores_min);
-                h.mem_idle_kb     -= layer->mem_min_kb;
-                h.gpus_idle       -= layer->gpus_min;
-                h.gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
-                job->cores_in_use  += layer->cores_min;
-                show.cores_in_use  += layer->cores_min;
-                f->state           = FrameState::RUNNING;   // claim it so we don't double-book
-
-                if (h.cores_idle <= 0) break;
+                // Pack up to job_frame_dispatch_max frames of this (layer, job)
+                // onto h before moving to the next candidate.
+                int job_booked = 0;
+                while (job_booked < job_frame_dispatch_max
+                       && host_booked < host_frame_dispatch_max
+                       && h.cores_idle > 0
+                       && fits_on_host_idle(*layer, h)
+                       && job->cores_in_use  + layer->cores_min <= job->max_cores
+                       && show.cores_in_use  + layer->cores_min <= show.burst_cores) {
+                    Frame* f = layer->next_waiting_frame();
+                    if (!f) break;
+                    out.push_back({&h, f});
+                    h.cores_idle      -= effective_cores(layer->cores_min);
+                    h.mem_idle_kb     -= layer->mem_min_kb;
+                    h.gpus_idle       -= layer->gpus_min;
+                    h.gpu_mem_idle_kb -= layer->gpu_mem_min_kb;
+                    job->cores_in_use  += layer->cores_min;
+                    show.cores_in_use  += layer->cores_min;
+                    f->state           = FrameState::RUNNING;
+                    ++job_booked;
+                    ++host_booked;
+                }
             }
         }
         return out;
