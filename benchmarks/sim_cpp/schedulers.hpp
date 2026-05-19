@@ -148,8 +148,11 @@ class LegacyScheduler {
 //   - least-idle-fits host selection (packs)
 //   - score-free first-fit on cores+mem+gpu
 //   - no placement score, no reservations, no backfill
-// Counts one db_op per (layer, host) compatibility check; the real Rust
-// scheduler does a B-tree O(log n) lookup so this is unfair to it.
+// Counts ONE scheduler op per booking attempt — the real scheduler pulls
+// a single host candidate out of an in-memory B-tree (see
+// pipeline/matcher.rs process_layer + host_cache CheckOut). The inner
+// host scan that follows in this sim is an in-memory stand-in for the
+// B-tree walk; it does not hit the DB and is not charged per host.
 
 class RustScheduler {
  public:
@@ -180,6 +183,13 @@ class RustScheduler {
                 if (job->cores_in_use + layer->cores_min > job->max_cores)   break;
                 if (show.cores_in_use + layer->cores_min > show.burst_cores) break;
 
+                // One scheduler op per booking attempt: the real Rust
+                // dispatcher pulls a single host candidate from the
+                // in-memory host-cache B-tree here. The host scan below
+                // is the in-memory stand-in for the tree walk and is
+                // not charged per host considered.
+                ++db_ops;
+
                 // core_saturation=true (default) packs: pick the host with the
                 // FEWEST idle cores that still fits. The first booking on a
                 // fresh cluster ties (all hosts identical); subsequent bookings
@@ -189,7 +199,6 @@ class RustScheduler {
                                        ?  std::numeric_limits<double>::infinity()
                                        : -std::numeric_limits<double>::infinity();
                 for (auto& h : c.hosts) {
-                    ++db_ops;
                     if (!alloc_compatible(*layer, h)) continue;
                     if (!tags_compatible(*layer, h))  continue;
                     if (!os_compatible(*layer, h))    continue;
