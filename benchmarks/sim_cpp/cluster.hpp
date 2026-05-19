@@ -54,6 +54,9 @@ struct Layer {
     std::string                layer_id;
     std::string                job_id;
     std::string                show_id;
+    // Production service name (arnold, nuke, spotless, ...). Used by the
+    // cue-layer-man script to look up the per-service ruleset.
+    std::string                service;
     int                        cores_min       = 0;
     int64_t                    mem_min_kb      = 0;
     int                        gpus_min        = 0;

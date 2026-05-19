@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Workload generator with production-measured constants. Ported verbatim from
-// benchmarks/offline/workload.py (which was in turn ported from the redis
-// branch's benchmarks/fragmentation/).
+// Workload generator with production-measured constants. Service mix and
+// per-service core/memory profiles derived from SPI production telemetry
+// (Cue_tasks 2024-01-01 to 2025-05-28, ~313M core-hours across the cluster).
 //
 // Two modes:
 //
 //   silos = false (default)
-//     Single allocation "A1". Frame layers carry only their tag requirements
-//     (general / render / midrange / highend). Both schedulers see the
-//     unified fleet.
+//     Single allocation "A1". Layers carry only their tag requirements.
 //
 //   silos = true
-//     Three allocations: "small_alloc" (elk), "mid_alloc" (ram),
-//     "big_alloc" (jaime). Each layer's allowed_allocs is set based on
-//     frame size, the way real-world operators manually partition their
-//     farm to make the legacy dispatcher behave. LegacyScheduler enforces
-//     the routing. PlannerScheduler ignores it (its win).
+//     Three allocations: small / mid / big. Each layer's allowed_allocs
+//     is set based on frame size, mirroring how real-world operators
+//     manually partition their farm. Used to model the OLD operational
+//     pattern (pre-cue-layer-man). Note: with the --script flag enabled,
+//     silos are no longer needed because the script handles host-class
+//     routing via tag rewrites.
 
 #pragma once
 
@@ -39,35 +38,51 @@ struct HostTypeConfig {
     int                   cores;
     double                memory_gb;
     std::set<std::string> tags;
-    std::string           silo_alloc;  // used when silos = true
+    std::string           silo_alloc;
 };
 
+// Host tag vocabulary mirrors the real cue-layer-man YAML rules so the
+// script's per-service tag rewrites land on the right host class:
+//   genhi    -> big-mem hosts (jaime)
+//   genmid   -> mid-mem hosts (ram)
+//   general  -> any host
+//   render   -> any host that can run render workloads
+//   midrange / highend  -> host capacity bands (ram / jaime)
+//   desktop  -> small-mem hosts (elk; in production these are
+//               artist desktops borrowed at night)
+//   fx, houdini -> specialty mid-tier (ram)
+//   util     -> small hosts (elk)
 inline const std::vector<HostTypeConfig> HOSTS_CONFIG = {
-    {"elk",   1004,  16, 125.0, {"general", "render"},                "small_alloc"},
-    {"ram",    303,  32, 251.0, {"general", "render", "midrange"},    "mid_alloc"},
-    {"jaime",  246, 128, 503.0, {"general", "render", "highend"},     "big_alloc"},
+    {"elk",   1004,  16, 125.0,
+        {"general", "render", "desktop", "util"},                   "small_alloc"},
+    {"ram",    303,  32, 251.0,
+        {"general", "render", "midrange", "genmid", "fx", "houdini"}, "mid_alloc"},
+    {"jaime",  246, 128, 503.0,
+        {"general", "render", "highend", "genhi"},                  "big_alloc"},
 };
 
-// ---- frame size distribution (power-of-2 cores) ---------------------------
+// ---- service mix from production CSV -------------------------------------
 
-struct FrameTypeConfig {
-    int                   cores;
-    double                percent;        // % of all frames
-    double                memory_gb;
-    std::set<std::string> layer_tags;     // tag requirement (OR-match host tags)
-    // Used only in silos = true. The allocations this frame's layer is
-    // allowed to run on. Mirrors how operators tag-and-allocate manually.
-    std::set<std::string> silo_allowed_allocs;
+struct ServiceConfig {
+    std::string name;             // matches cue-layer-man.yml service key
+    double      core_hours_share; // fraction of total cluster core-hours
+    double      avg_cores;        // mean cores per frame (from CSV "Avg Cores")
+    double      avg_mem_gb;       // mean max RSS per frame
 };
 
-inline const std::vector<FrameTypeConfig> FRAME_TYPES = {
-    { 1, 22.89,   0.52, {"general"},                {"small_alloc"}},
-    { 2, 25.54,   1.38, {"general"},                {"small_alloc"}},
-    { 4, 34.22,   6.44, {"render"},                 {"small_alloc"}},
-    { 8, 14.55,  27.27, {"render"},                 {"mid_alloc"}},
-    {16,  1.88,  63.85, {"render"},                 {"mid_alloc"}},
-    {32,  0.28, 109.00, {"midrange", "highend"},    {"big_alloc"}},
-    {64,  0.03, 233.12, {"highend"},                {"big_alloc"}},
+// Top services by core-hours, covering ~99.4% of cluster work.
+// Numbers from Cue_tasks_2024-01-01_2025-05-28.csv.
+inline const std::vector<ServiceConfig> SERVICES = {
+    {"arnold",       0.919,  6.07,  21.6},
+    {"spotless",     0.030,  2.00,   1.1},
+    {"nuke",         0.025,  3.91,   7.5},
+    {"simulation16", 0.006, 16.26,  13.2},
+    {"shell",        0.005,  1.53,   0.6},
+    {"simulation8",  0.004,  8.27,  11.5},
+    {"simulation32", 0.003, 31.74,  43.0},
+    {"simulation4",  0.003,  4.16,   6.0},
+    {"houdini",      0.002,  1.53,   4.5},
+    {"nukehi",       0.001,  9.85,  14.1},
 };
 
 inline const std::vector<int> PRIORITIES = {10, 30, 50, 70, 90};
@@ -102,7 +117,6 @@ inline Cluster build_production_cluster(int seed, double scale, bool silos) {
             ++next_id;
         }
     }
-    // One Show with effectively unlimited burst in each alloc the simulator uses.
     if (silos) {
         c.shows.push_back(Show{"benchmark", "small_alloc", 1'000'000'000, 0});
         c.shows.push_back(Show{"benchmark", "mid_alloc",   1'000'000'000, 0});
@@ -124,15 +138,16 @@ struct WorkloadConfig {
     double runtime_sigma         = 0.9;
 };
 
-inline const FrameTypeConfig& pick_frame_type(std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> u(0.0, 100.0);
+// Pick a service weighted by its core-hours share.
+inline const ServiceConfig& pick_service(std::mt19937_64& rng) {
+    std::uniform_real_distribution<double> u(0.0, 1.0);
     double r   = u(rng);
     double acc = 0.0;
-    for (const auto& ft : FRAME_TYPES) {
-        acc += ft.percent;
-        if (r <= acc) return ft;
+    for (const auto& s : SERVICES) {
+        acc += s.core_hours_share;
+        if (r <= acc) return s;
     }
-    return FRAME_TYPES.front();
+    return SERVICES.front();
 }
 
 inline std::string short_uuid(std::mt19937_64& rng) {
@@ -143,6 +158,12 @@ inline std::string short_uuid(std::mt19937_64& rng) {
     return s;
 }
 
+// Map a service's avg cores to a discrete request count. We round to the
+// nearest integer; this is a coarse model but it matches what real layers
+// look like after cue-layer-man (or, without it, the original layer
+// specification). Pre-script tags are kept simple: {general} so the layer
+// can land on any host. The script (if enabled) will rewrite both the
+// cores and the tags based on the service's per-service rules.
 inline Job generate_job(std::mt19937_64& rng,
                         double ts,
                         int target_cores,
@@ -156,19 +177,29 @@ inline Job generate_job(std::mt19937_64& rng,
                        0, static_cast<int>(PRIORITIES.size()) - 1)(rng)];
     j.ts_started = ts;
 
-    const FrameTypeConfig& spec = pick_frame_type(rng);
-    int n_frames = std::max(1, target_cores / std::max(1, spec.cores));
+    const ServiceConfig& svc = pick_service(rng);
+    int cores      = std::max(1, static_cast<int>(std::lround(svc.avg_cores)));
+    int n_frames   = std::max(1, target_cores / cores);
 
     Layer L;
     L.layer_id        = j.job_id + "-layer-0";
     L.job_id          = j.job_id;
     L.show_id         = j.show_id;
-    L.cores_min       = spec.cores;
-    L.mem_min_kb      = static_cast<int64_t>(spec.memory_gb * GB_KB);
+    L.service         = svc.name;
+    L.cores_min       = cores;
+    L.mem_min_kb      = static_cast<int64_t>(svc.avg_mem_gb * GB_KB);
     L.gpus_min        = 0;
     L.gpu_mem_min_kb  = 0;
-    L.tags            = spec.layer_tags;
-    L.allowed_allocs  = silos ? spec.silo_allowed_allocs : std::set<std::string>{};
+    L.tags            = {"general"};   // pre-script; --script may rewrite
+    // In silos mode (pre-cue-layer-man pattern) route by memory:
+    //   >= 70 GB  -> big_alloc only
+    //   >= 20 GB  -> mid or big
+    //   else      -> small_alloc
+    if (silos) {
+        if (svc.avg_mem_gb >= 70.0)       L.allowed_allocs = {"big_alloc"};
+        else if (svc.avg_mem_gb >= 20.0)  L.allowed_allocs = {"mid_alloc", "big_alloc"};
+        else                              L.allowed_allocs = {"small_alloc", "mid_alloc"};
+    }
     L.runtime_median_s = runtime_median_s;
     L.runtime_sigma   = runtime_sigma;
 
