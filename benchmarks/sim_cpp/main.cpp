@@ -36,6 +36,7 @@ struct Args {
     std::string right              = "smart";
     std::string left_csv;
     std::string right_csv;
+    bool        wide_audit         = false;
 };
 
 static void usage(const char* argv0) {
@@ -55,6 +56,7 @@ static void usage(const char* argv0) {
         "  --right NAME             right column scheduler (legacy|rust|smart) [smart]\n"
         "  --left-csv PATH          write per-tick left-scheduler metrics\n"
         "  --right-csv PATH         write per-tick right-scheduler metrics\n"
+        "  --wide-audit             dump per-wide-layer (cores_min>=16) outcome\n"
         "  --help                   show this help\n",
         argv0);
 }
@@ -95,6 +97,7 @@ static bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--smart-csv")          { if (!next_s(a.right_csv)) return false; }
         else if (k == "--left-csv")           { if (!next_s(a.left_csv)) return false; }
         else if (k == "--right-csv")          { if (!next_s(a.right_csv)) return false; }
+        else if (k == "--wide-audit")         { a.wide_audit = true; }
         else if (k == "--help" || k == "-h")  { usage(argv[0]); std::exit(0); }
         else {
             std::fprintf(stderr, "unknown option: %s\n", k.c_str());
@@ -219,6 +222,43 @@ int main(int argc, char** argv) {
     if (!a.right_csv.empty()) {
         write_csv(a.right_csv, res_r.metrics);
         std::printf("%s per-tick: %s\n", display_name(a.right), a.right_csv.c_str());
+    }
+
+    if (a.wide_audit) {
+        auto print_audit = [&](const char* name, const std::vector<WaitRecord>& ws) {
+            std::vector<const WaitRecord*> wide;
+            for (const auto& r : ws) if (r.cores_min >= 16) wide.push_back(&r);
+            std::sort(wide.begin(), wide.end(),
+                      [](const WaitRecord* x, const WaitRecord* y) {
+                          if (x->priority != y->priority) return x->priority < y->priority;
+                          return x->first_seen_at < y->first_seen_at;
+                      });
+            std::printf("\n--- wide-layer audit: %s -------------------------------------\n",
+                        name);
+            std::printf("%-3s %-5s %-9s %-9s %-7s  %s\n",
+                        "pri", "cores", "seen_at", "disp_at", "wait_s", "outcome");
+            int disp = 0, never = 0;
+            double sum_disp_wait = 0;
+            for (const auto* r : wide) {
+                bool dispatched = r->first_dispatched_at >= 0;
+                double wait_s = dispatched
+                    ? (r->first_dispatched_at - r->first_seen_at)
+                    : (sim_end - r->first_seen_at);
+                std::printf("%-3d %-5d %-9.0f ",
+                            r->priority, r->cores_min, r->first_seen_at);
+                if (dispatched) {
+                    std::printf("%-9.0f %-7.0f  DISPATCHED\n",
+                                r->first_dispatched_at, wait_s);
+                    ++disp; sum_disp_wait += wait_s;
+                } else {
+                    std::printf("%-9s %-7.0f  NEVER\n", "-", wait_s);
+                    ++never;
+                }
+            }
+            std::printf("  totals: %d dispatched, %d never\n", disp, never);
+        };
+        print_audit(display_name(a.left),  waits_l);
+        print_audit(display_name(a.right), waits_r);
     }
     return 0;
 }
