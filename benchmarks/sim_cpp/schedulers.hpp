@@ -17,6 +17,7 @@
 #include "cluster.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <set>
@@ -105,6 +106,15 @@ class LegacyScheduler {
     double   tick_seconds   = 1.0;
     double   db_time_ms     = 0.0;   // cumulative simulated DB time
 
+    // Legacy is event-driven: a host runs findDispatchJobs only when it
+    // reports, ~every host_report_interval_s. So per tick only a rotating
+    // slice of the fleet is queried, not all hosts. host_cursor persists
+    // across ticks to round-robin the fleet. Without this the sim would
+    // issue ~num_hosts heavy queries per tick (~30x production), crushing
+    // utilisation to an artifact.
+    double   host_report_interval_s = 30.0;
+    size_t   host_cursor            = 0;
+
     // Production CoreUnitDispatcher caps per-(host,job) dispatch at
     // dispatcher.job_frame_dispatch_max (default 8) and total per-host
     // dispatch at dispatcher.host_frame_dispatch_max (default 12). The
@@ -150,7 +160,22 @@ class LegacyScheduler {
         const double budget_ms = db_parallelism * tick_seconds * 1000.0;
         double used_ms = 0.0;
         bool out_of_budget = false;
-        for (auto& h : c.hosts) {
+
+        // Host-report cadence: process only the slice of the fleet that
+        // "reports" this tick (~num_hosts * tick_seconds / report_interval),
+        // round-robined via host_cursor across ticks. This is the production
+        // event-driven rate; without it we'd query every host every tick.
+        const size_t n_hosts = c.hosts.size();
+        size_t hosts_this_tick = n_hosts;
+        if (host_report_interval_s > 0.0 && n_hosts > 0) {
+            double frac = tick_seconds / host_report_interval_s;
+            hosts_this_tick = static_cast<size_t>(std::ceil(frac * n_hosts));
+            if (hosts_this_tick < 1)        hosts_this_tick = 1;
+            if (hosts_this_tick > n_hosts)  hosts_this_tick = n_hosts;
+        }
+        for (size_t scanned = 0; scanned < hosts_this_tick && n_hosts > 0; ++scanned) {
+            Host& h = c.hosts[host_cursor];
+            host_cursor = (host_cursor + 1) % n_hosts;
             if (out_of_budget) break;
             if (h.cores_idle <= 0) continue;
             if (used_ms + db_cost.query_heavy_ms > budget_ms) break;
