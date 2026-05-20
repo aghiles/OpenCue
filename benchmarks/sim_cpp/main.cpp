@@ -130,6 +130,8 @@ struct RunResult {
     int64_t                                     ksm_co_located = 0;
     double                                      ksm_avg_pl_h   = 0.0;
     int64_t                                     ksm_buckets    = 0;
+    double                                      db_time_ms     = 0.0;
+    int                                         db_parallelism = 1;
 };
 
 static void run_named(const std::string& name, const Args& a,
@@ -145,25 +147,34 @@ static void run_named(const std::string& name, const Args& a,
     if (name == "legacy") {
         Simulator<LegacyScheduler> sim(std::move(cluster), std::move(arrivals),
                                         LegacyScheduler{}, a.tick_seconds, a.seed + 7);
+        sim.scheduler.tick_seconds = a.tick_seconds;
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        out.db_time_ms     = sim.scheduler.db_time_ms;
+        out.db_parallelism = sim.scheduler.db_parallelism;
         record_ksm(sim);
     } else if (name == "rust") {
         Simulator<RustScheduler> sim(std::move(cluster), std::move(arrivals),
                                       RustScheduler{}, a.tick_seconds, a.seed + 7);
+        sim.scheduler.tick_seconds = a.tick_seconds;
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        out.db_time_ms     = sim.scheduler.db_time_ms;
+        out.db_parallelism = sim.scheduler.db_parallelism;
         record_ksm(sim);
     } else {  // planner
         Simulator<PlannerScheduler> sim(std::move(cluster), std::move(arrivals),
                                        PlannerScheduler{}, a.tick_seconds, a.seed + 7);
+        sim.scheduler.tick_seconds = a.tick_seconds;
         if (a.silos && a.planner_ignore_allocs) sim.scheduler.ignore_allocs = true;
         if (a.planner_strict)                   sim.scheduler.strict_reservations = true;
         sim.run(sim_seconds);
         out.metrics = std::move(sim.metrics);
         out.waits   = std::move(sim.wait_records);
+        out.db_time_ms     = sim.scheduler.db_time_ms;
+        out.db_parallelism = sim.scheduler.db_parallelism;
         record_ksm(sim);
     }
 }
@@ -261,6 +272,24 @@ int main(int argc, char** argv) {
                 (long long)res_l.ksm_buckets, (long long)res_r.ksm_buckets);
     std::printf("  total dispatched frames                  %10lld  %10lld\n",
                 (long long)res_l.ksm_total, (long long)res_r.ksm_total);
+
+    // DB-time accounting (simulated). saturation = DB-time consumed over
+    // the DB-time available (parallelism * sim duration). 100% means the
+    // scheduler was DB-bound the whole run.
+    double sim_s = cfg.simulation_seconds;
+    auto db_sat = [&](double db_ms, int par) {
+        double avail_ms = par * sim_s * 1000.0;
+        return avail_ms > 0 ? 100.0 * db_ms / avail_ms : 0.0;
+    };
+    std::printf("\n--- DB time (simulated) ---\n");
+    std::printf("%-40s %12s%12s\n", "METRIC", display_name(a.left), display_name(a.right));
+    std::printf("  DB threads (parallelism)                 %10d  %10d\n",
+                res_l.db_parallelism, res_r.db_parallelism);
+    std::printf("  DB-seconds consumed                      %10.1f  %10.1f\n",
+                res_l.db_time_ms / 1000.0, res_r.db_time_ms / 1000.0);
+    std::printf("  DB saturation                            %10.1f%%  %10.1f%%\n",
+                db_sat(res_l.db_time_ms, res_l.db_parallelism),
+                db_sat(res_r.db_time_ms, res_r.db_parallelism));
 
     if (!a.left_csv.empty()) {
         write_csv(a.left_csv, res_l.metrics);

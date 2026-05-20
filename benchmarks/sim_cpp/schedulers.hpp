@@ -32,6 +32,27 @@ struct Booking {
     Frame* frame;
 };
 
+// ---- DB cost model --------------------------------------------------------
+//
+// DB operations are NOT free. Each tick a scheduler gets a budget of
+// simulated DB-time = db_parallelism * tick_seconds. Operations draw it
+// down; when exhausted the scheduler stops for that tick and the rest of
+// the work waits for the next tick. This is charged in SIMULATED time, so
+// the C++ runs as fast as ever -- only the simulated throughput reflects
+// the DB bottleneck.
+//
+// Costs are relative (no production latency numbers available; consistent
+// across all scenarios). The legacy query is far heavier than the planner
+// query, justified by the SQL: FIND_JOBS_BY_SHOW is an 8-table join with a
+// regex tag predicate, a window function, and a triple-nested subquery,
+// run per host per bookable show. The planner's per-group candidate query
+// is a simple filtered scan over one homogeneous host group.
+struct DbCost {
+    double query_heavy_ms = 25.0;   // legacy FIND_JOBS_BY_SHOW (per host)
+    double query_light_ms = 5.0;    // planner per-group candidate query
+    double commit_ms      = 10.0;   // startFrameAndProc transaction
+};
+
 // ---- common helpers -------------------------------------------------------
 
 inline bool fits_on_host_idle(const Layer& L, const Host& h) {
@@ -77,6 +98,13 @@ class LegacyScheduler {
  public:
     int64_t db_ops = 0;  // single-writer (the one thread that owns this scheduler)
 
+    // DB-time accounting (simulated). Legacy runs the heavy FIND_JOBS_BY_SHOW
+    // query once per host it visits, on 14 booking threads.
+    DbCost   db_cost;
+    int      db_parallelism = 14;
+    double   tick_seconds   = 1.0;
+    double   db_time_ms     = 0.0;   // cumulative simulated DB time
+
     // Production CoreUnitDispatcher caps per-(host,job) dispatch at
     // dispatcher.job_frame_dispatch_max (default 8) and total per-host
     // dispatch at dispatcher.host_frame_dispatch_max (default 12). The
@@ -115,8 +143,18 @@ class LegacyScheduler {
         // total across any jobs, stop. Mirrors production CoreUnitDispatcher
         // dispatchHost -> dispatchHost(host, job) -> findNextDispatchFrames
         // pattern (CoreUnitDispatcher.java:135-321).
+        //
+        // DB throttle: each host visit costs one heavy FIND_JOBS_BY_SHOW query
+        // and each booking a commit. When the per-tick DB-time budget is spent,
+        // stop -- the unvisited hosts wait for the next tick.
+        const double budget_ms = db_parallelism * tick_seconds * 1000.0;
+        double used_ms = 0.0;
+        bool out_of_budget = false;
         for (auto& h : c.hosts) {
+            if (out_of_budget) break;
             if (h.cores_idle <= 0) continue;
+            if (used_ms + db_cost.query_heavy_ms > budget_ms) break;
+            used_ms += db_cost.query_heavy_ms;   // findDispatchJobs for this host
             int host_booked = 0;
             for (const auto& [layer, job] : layer_jobs) {
                 ++db_ops;
@@ -139,9 +177,11 @@ class LegacyScheduler {
                        && fits_on_host_idle(*layer, h)
                        && job->cores_in_use  + layer->cores_min <= job->max_cores
                        && show.cores_in_use  + layer->cores_min <= show.burst_cores) {
+                    if (used_ms + db_cost.commit_ms > budget_ms) { out_of_budget = true; break; }
                     Frame* f = layer->next_waiting_frame();
                     if (!f) break;
                     out.push_back({&h, f});
+                    used_ms += db_cost.commit_ms;
                     h.cores_idle      -= effective_cores(layer->cores_min);
                     h.mem_idle_kb     -= layer->mem_min_kb;
                     h.gpus_idle       -= layer->gpus_min;
@@ -152,8 +192,10 @@ class LegacyScheduler {
                     ++job_booked;
                     ++host_booked;
                 }
+                if (out_of_budget) break;
             }
         }
+        db_time_ms += used_ms;
         return out;
     }
 };
@@ -184,6 +226,14 @@ class RustScheduler {
  public:
     int64_t db_ops = 0;
     bool    core_saturation = true;   // mirrors HostBookingStrategy default
+
+    // DB-time accounting (simulated). The host candidate comes from an
+    // in-memory B-tree (no DB query), so only commits hit the DB. 8 workers.
+    DbCost   db_cost;
+    int      db_parallelism = 8;
+    double   tick_seconds   = 1.0;
+    double   db_time_ms     = 0.0;
+
     // Production caps mirrored from rust/crates/scheduler/src/config/mod.rs:
     //   dispatch_frames_per_layer_limit = 20  (max frames per dispatch_inner call)
     //   host_candidate_attempts_per_layer = 10 (max hosts per process_layer call)
@@ -225,11 +275,16 @@ class RustScheduler {
         // next layer gets a turn. A layer makes at most
         // host_candidate_attempts_per_layer batches per tick (matches the
         // attempts cap inside process_layer).
+        // DB throttle: only commits hit the DB (host pick is in-memory).
+        const double budget_ms = db_parallelism * tick_seconds * 1000.0;
+        double used_ms = 0.0;
+        bool out_of_budget = false;
         std::unordered_map<Layer*, int> attempts_used;
         bool progress = true;
-        while (progress) {
+        while (progress && !out_of_budget) {
             progress = false;
             for (const auto& [layer, job] : layer_jobs) {
+                if (out_of_budget) break;
                 if (layer->waiting_frame_count() <= 0) continue;
                 if (attempts_used[layer] >= host_candidate_attempts_per_layer) continue;
                 Show& show = c.show_of(layer->show_id);
@@ -268,9 +323,11 @@ class RustScheduler {
                        && fits_on_host_idle(*layer, *best)
                        && job->cores_in_use  + layer->cores_min <= job->max_cores
                        && show.cores_in_use  + layer->cores_min <= show.burst_cores) {
+                    if (used_ms + db_cost.commit_ms > budget_ms) { out_of_budget = true; break; }
                     Frame* f = layer->next_waiting_frame();
                     if (!f) break;
                     out.push_back({best, f});
+                    used_ms += db_cost.commit_ms;
                     best->cores_idle      -= effective_cores(layer->cores_min);
                     best->mem_idle_kb     -= layer->mem_min_kb;
                     best->gpus_idle       -= layer->gpus_min;
@@ -283,6 +340,7 @@ class RustScheduler {
                 }
             }
         }
+        db_time_ms += used_ms;
         return out;
     }
 };
@@ -358,6 +416,13 @@ struct Reservation {
 class PlannerScheduler {
  public:
     int64_t db_ops = 0;  // single-writer (the one thread that owns this scheduler)
+
+    // DB-time accounting (simulated). One light candidate query per spec
+    // group per tick; commits run across an 8-worker pool.
+    DbCost   db_cost;
+    int      db_parallelism = 8;
+    double   tick_seconds   = 1.0;
+    double   db_time_ms     = 0.0;
 
     // Optional: in silos mode the planner can be told to IGNORE alloc routing
     // (treat the heterogeneous fleet as one pool). When false (default), the
@@ -441,8 +506,15 @@ class PlannerScheduler {
 
         std::set<std::string> seen_layer_ids;
 
+        // DB throttle: one light candidate query per group + a commit per
+        // booking, across an 8-worker commit pool.
+        const double budget_ms = db_parallelism * tick_seconds * 1000.0;
+        double used_ms = 0.0;
+
         // ---- 3) per-group dispatch + reconcile -----------------------
         for (auto& [spec, hosts] : groups) {
+            if (used_ms + db_cost.query_light_ms > budget_ms) break;
+            used_ms += db_cost.query_light_ms;   // per-group candidate query
             ++db_ops;  // one "candidate query" per group
 
             // Build the per-group candidate set. When ignore_allocs=false
@@ -520,10 +592,12 @@ class PlannerScheduler {
                         if (s < best_score) { best_score = s; best = h; }
                     }
                     if (!best) break;
+                    if (used_ms + db_cost.commit_ms > budget_ms) break;
 
                     Frame* f = layer->next_waiting_frame();
                     if (!f) break;
                     out.push_back({best, f});
+                    used_ms += db_cost.commit_ms;
 
                     best->cores_idle      -= effective_cores(layer->cores_min);
                     best->mem_idle_kb     -= layer->mem_min_kb;
@@ -575,6 +649,7 @@ class PlannerScheduler {
                 ++it;
         }
 
+        db_time_ms += used_ms;
         current_cluster_ = nullptr;
         return out;
     }
