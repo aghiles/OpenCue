@@ -187,6 +187,7 @@ inline Job generate_job(std::mt19937_64& rng,
     L.show_id         = j.show_id;
     L.service         = svc.name;
     L.cores_min       = cores;
+    L.natural_cores   = cores;   // pre-script demand; script rewrites cores_min only
     L.mem_min_kb      = static_cast<int64_t>(svc.avg_mem_gb * GB_KB);
     L.gpus_min        = 0;
     L.gpu_mem_min_kb  = 0;

@@ -37,7 +37,11 @@ inline AggregateStats aggregate(const std::vector<TickMetrics>& metrics) {
     int64_t bookings = 0;
     for (const auto& m : metrics) {
         s.cores_total = std::max<int64_t>(s.cores_total, m.cores_total);
-        double u = m.cores_total ? double(m.cores_busy)        / double(m.cores_total) : 0.0;
+        // Utilisation is computed from USEFUL cores (natural demand), not
+        // reserved cores. Over-pinning (script forcing cores_min above the
+        // real need) reserves cores that do no work, so it correctly LOWERS
+        // utilisation rather than inflating it.
+        double u = m.cores_total ? double(m.cores_useful)      / double(m.cores_total) : 0.0;
         double f = m.cores_total ? double(m.fragmented_cores)  / double(m.cores_total) : 0.0;
         util_sum += u; frag_sum += f;
         if (u > util_peak) util_peak = u;

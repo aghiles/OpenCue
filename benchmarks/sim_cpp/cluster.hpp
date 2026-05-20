@@ -58,6 +58,13 @@ struct Layer {
     // cue-layer-man script to look up the per-service ruleset.
     std::string                service;
     int                        cores_min       = 0;
+    // The "natural" core demand of the work, before any cue-layer-man
+    // pinning. Utilisation is computed from this (useful work), while
+    // cores_min is what's actually reserved on the host. When the script
+    // over-pins (cores_min > natural_cores), the difference is reserved
+    // but wasted -- so utilisation correctly drops. Equals cores_min when
+    // no script is applied.
+    int                        natural_cores   = 0;
     int64_t                    mem_min_kb      = 0;
     int                        gpus_min        = 0;
     int64_t                    gpu_mem_min_kb  = 0;

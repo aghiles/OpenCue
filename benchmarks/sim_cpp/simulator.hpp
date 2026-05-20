@@ -19,7 +19,8 @@ namespace sim {
 struct TickMetrics {
     double  t                  = 0.0;
     int64_t cores_total        = 0;
-    int64_t cores_busy         = 0;
+    int64_t cores_busy         = 0;   // reserved cores (cores_min) -- legacy metric
+    int64_t cores_useful       = 0;   // cores doing real work (natural_cores)
     int64_t cores_idle         = 0;
     int64_t frames_running     = 0;
     int64_t frames_waiting     = 0;
@@ -79,6 +80,10 @@ class Simulator {
  private:
     std::vector<Job> pending_arrivals;   // reversed: back() is earliest
     std::mt19937_64  rng;
+    // Sum of effective_cores(natural_cores) over running frames -- the
+    // cores actually doing useful work. Tracked incrementally so the
+    // utilisation metric reflects useful work, not over-pinned reservation.
+    double useful_busy_eff = 0.0;
 
     void complete_finished_frames() {
         for (auto& h : cluster.hosts) {
@@ -93,6 +98,9 @@ class Simulator {
                         h.mem_idle_kb     += L->mem_min_kb;
                         h.gpus_idle       += L->gpus_min;
                         h.gpu_mem_idle_kb += L->gpu_mem_min_kb;
+                        useful_busy_eff   -= effective_cores(
+                            L->natural_cores > 0 ? L->natural_cores : L->cores_min);
+                        if (useful_busy_eff < 0) useful_busy_eff = 0;
                         Job* job = job_of(cluster, L->job_id);
                         if (job) {
                             job->cores_in_use = std::max(0, job->cores_in_use - L->cores_min);
@@ -182,6 +190,8 @@ class Simulator {
             b.frame->start_time  = now;
             b.frame->finish_time = now + sample_frame_runtime(rng, *L);
             b.host->running.push_back(b.frame);
+            useful_busy_eff += effective_cores(
+                L->natural_cores > 0 ? L->natural_cores : L->cores_min);
             ++total_bookings;
             auto it = wait_records.find(L->layer_id);
             if (it != wait_records.end() && it->second.first_dispatched_at < 0)
@@ -195,6 +205,7 @@ class Simulator {
         m.cores_total        = cluster.total_cores();
         m.cores_idle         = cluster.total_idle_cores();
         m.cores_busy         = m.cores_total - m.cores_idle;
+        m.cores_useful       = static_cast<int64_t>(useful_busy_eff);
         m.frames_running     = cluster.running_frame_count();
         m.frames_waiting     = cluster.waiting_frame_count();
         m.bookings_this_tick = bookings_count;
