@@ -188,6 +188,49 @@ public class ProcDaoJdbc extends JdbcDaoSupport implements ProcDao {
         }
     }
 
+    private static final String UPDATE_HOST_RESOURCES_BOOK = "UPDATE host SET "
+            + "int_cores_idle = int_cores_idle - ?, int_mem_idle = int_mem_idle - ?, "
+            + "int_gpus_idle = int_gpus_idle - ?, int_gpu_mem_idle = int_gpu_mem_idle - ? "
+            + "WHERE pk_host = ?";
+
+    @Override
+    public void batchInsertVirtualProcs(List<VirtualProc> procs) {
+        if (procs == null || procs.isEmpty()) {
+            return;
+        }
+        long memReservedMin =
+                env.getRequiredProperty("dispatcher.memory.mem_reserved_min", Long.class);
+        long memGpuReservedMin =
+                env.getRequiredProperty("dispatcher.memory.mem_gpu_reserved_min", Long.class);
+
+        List<Object[]> procRows = new ArrayList<Object[]>(procs.size());
+        // Aggregate host idle decrements: a single host commonly receives many
+        // procs in one tick, so collapse them into one UPDATE per host.
+        Map<String, long[]> hostDelta = new HashMap<String, long[]>();
+        for (VirtualProc proc : procs) {
+            proc.id = SqlUtil.genKeyRandom();
+            procRows.add(new Object[] {proc.getProcId(), proc.getHostId(), proc.getShowId(),
+                    proc.getLayerId(), proc.getJobId(), proc.getFrameId(), proc.coresReserved,
+                    proc.memoryReserved, proc.memoryReserved, memReservedMin, proc.gpusReserved,
+                    proc.gpuMemoryReserved, proc.gpuMemoryReserved, memGpuReservedMin,
+                    proc.isLocalDispatch});
+            long[] d = hostDelta.computeIfAbsent(proc.getHostId(), k -> new long[4]);
+            d[0] += proc.coresReserved;
+            d[1] += proc.memoryReserved;
+            d[2] += proc.gpusReserved;
+            d[3] += proc.gpuMemoryReserved;
+        }
+
+        getJdbcTemplate().batchUpdate(INSERT_VIRTUAL_PROC, procRows);
+
+        List<Object[]> hostRows = new ArrayList<Object[]>(hostDelta.size());
+        for (Map.Entry<String, long[]> e : hostDelta.entrySet()) {
+            long[] d = e.getValue();
+            hostRows.add(new Object[] {d[0], d[1], d[2], d[3], e.getKey()});
+        }
+        getJdbcTemplate().batchUpdate(UPDATE_HOST_RESOURCES_BOOK, hostRows);
+    }
+
     // spotless:off
     private static final String UPDATE_VIRTUAL_PROC_ASSIGN =
             "UPDATE "

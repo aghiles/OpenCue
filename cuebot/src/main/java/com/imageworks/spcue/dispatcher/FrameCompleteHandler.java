@@ -279,6 +279,17 @@ public class FrameCompleteHandler {
              */
             boolean unbookProc = proc.unbooked;
 
+            /*
+             * When booking is disabled, or the new Scheduler is enabled, suppress the legacy
+             * per-host BookingQueue enqueues below so the two booking paths never both run. The
+             * Scheduler reaches this host on its own tick. This mirrors the guard in
+             * HostReportHandler and prevents legacy booking threads from racing the Scheduler's
+             * batched commit for the same frames.
+             */
+            boolean bookingOff =
+                    env.getProperty("dispatcher.turn_off_booking", Boolean.class, false)
+                    || env.getProperty("scheduler.enabled", Boolean.class, false);
+
             dispatchSupport.updateUsageCounters(frame, report.getExitStatus());
 
             boolean isLayerComplete = false;
@@ -469,7 +480,7 @@ public class FrameCompleteHandler {
                  * fractional can cause storms of booking requests that don't have a chance of
                  * finding a suitable frame to run.
                  */
-                if (!proc.isLocalDispatch && proc.coresReserved >= 100
+                if (!bookingOff && !proc.isLocalDispatch && proc.coresReserved >= 100
                         && dispatchSupport.isCueBookable(job)) {
 
                     bookingQueue.execute(new DispatchBookHost(
@@ -489,7 +500,8 @@ public class FrameCompleteHandler {
              * This will handle show balancing in the future.
              */
 
-            if (!proc.isLocalDispatch && randomNumber.nextInt(100) <= Dispatcher.UNBOOK_FREQUENCY
+            if (!bookingOff && !proc.isLocalDispatch
+                    && randomNumber.nextInt(100) <= Dispatcher.UNBOOK_FREQUENCY
                     && System.currentTimeMillis() > lastUnbook.get()) {
 
                 // First make sure all jobs have their min cores
@@ -543,7 +555,7 @@ public class FrameCompleteHandler {
                 /*
                  * Check for stranded cores on the host.
                  */
-                if (!proc.isLocalDispatch && dispatchSupport.hasStrandedCores(proc)
+                if (!bookingOff && !proc.isLocalDispatch && dispatchSupport.hasStrandedCores(proc)
                         && jobManager.isLayerThreadable(frame)
                         && dispatchSupport.isJobBookable(job)) {
 
@@ -558,11 +570,22 @@ public class FrameCompleteHandler {
                     }
                 }
 
-                // Book the next frame of this job on the same proc
+                // Book the next frame of this job on the same proc.
+                //
+                // In NEW (scheduler) mode the reactive booking path is off:
+                // rebooking here would race the Scheduler's batched commit and
+                // dispatch outside the single batched commit path (the source
+                // of the inline-path deadlock). Instead, unbook the proc so its
+                // cores return to the host's idle pool; the Scheduler rebooks on
+                // its next tick, preferring the same host via a locality score
+                // bonus (see Scheduler placement). stopFrame only nulled the
+                // proc's pk_frame, so without this the reserved cores would leak.
                 if (proc.isLocalDispatch) {
                     dispatchQueue.execute(new DispatchNextFrame(job, proc, localDispatcher));
-                } else {
+                } else if (!bookingOff) {
                     dispatchQueue.execute(new DispatchNextFrame(job, proc, dispatcher));
+                } else {
+                    dispatchSupport.unbookProc(proc);
                 }
             } else {
                 dispatchSupport.unbookProc(proc, "frame state was " + newFrameState.toString());
