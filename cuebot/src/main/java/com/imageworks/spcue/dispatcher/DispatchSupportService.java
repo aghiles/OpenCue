@@ -15,6 +15,7 @@
 
 package com.imageworks.spcue.dispatcher;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -237,6 +238,52 @@ public class DispatchSupportService implements DispatchSupport {
 
         // Publish FRAME_STARTED event (WAITING -> RUNNING transition)
         publishFrameStartedEvent(frame, proc, previousState);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRED)
+    public List<FrameBooking> startFramesAndProcsBatch(List<FrameBooking> bookings) {
+        if (bookings == null || bookings.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+
+        // 1. Version-guarded RUNNING transition for all frames, batched. The
+        // returned mask tells us which frames we actually won.
+        boolean[] won = frameDao.batchUpdateFramesStarted(bookings);
+
+        List<FrameBooking> winners = new ArrayList<FrameBooking>(bookings.size());
+        List<VirtualProc> winnerProcs = new ArrayList<VirtualProc>(bookings.size());
+        for (int i = 0; i < bookings.size(); i++) {
+            if (won[i]) {
+                FrameBooking b = bookings.get(i);
+                // Stamp the frame linkage onto the proc before the batch insert.
+                // The inline path does this in reserveProc(); the planning path
+                // (CoreUnitDispatcher.planHost) builds the proc but never sets it,
+                // so without this every batch-inserted proc lands with
+                // pk_frame=NULL, backing no frame while holding its host cores
+                // (the frame shows RUNNING but its cores are stranded).
+                b.proc.frameId = b.frame.getFrameId();
+                b.proc.jobId = b.frame.getJobId();
+                b.proc.layerId = b.frame.getLayerId();
+                b.proc.showId = b.frame.getShowId();
+                winners.add(b);
+                winnerProcs.add(b.proc);
+            }
+        }
+        if (winnerProcs.isEmpty()) {
+            return winners;
+        }
+
+        // 2. Insert the procs and decrement host idle resources, batched. The
+        // subscription/layer/job/folder/point counters are batched by the
+        // Scheduler from the winners returned here.
+        procDao.batchInsertVirtualProcs(winnerProcs);
+
+        // 3. Publish FRAME_STARTED events (WAITING -> RUNNING).
+        for (FrameBooking b : winners) {
+            publishFrameStartedEvent(b.frame, b.proc, FrameState.WAITING);
+        }
+        return winners;
     }
 
     @Transactional(propagation = Propagation.REQUIRED, readOnly = true)

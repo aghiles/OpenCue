@@ -97,6 +97,19 @@ public interface ProcDao {
     void insertVirtualProc(VirtualProc proc);
 
     /**
+     * Batch variant of {@link #insertVirtualProc}: inserts many procs in one
+     * round-trip and applies the host idle-resource decrement aggregated per
+     * host (one UPDATE per distinct host). Does NOT touch the
+     * subscription/layer/job/folder/point counters, the Scheduler batches
+     * those separately. Each proc is assigned a fresh id. Intended for the
+     * Scheduler's batch commit path, where the frames were already won via a
+     * version-guarded update so duplicate inserts cannot occur.
+     *
+     * @param procs the procs to insert (non-local)
+     */
+    void batchInsertVirtualProcs(java.util.List<VirtualProc> procs);
+
+    /**
      * Deletes an existing virtual proc
      *
      * @param proc
