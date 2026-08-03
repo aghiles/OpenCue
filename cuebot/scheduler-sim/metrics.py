@@ -22,21 +22,11 @@ STEP = 2.0
 
 
 def q(sql):
-    """Run one SQL statement and return its non-empty result rows as strings.
-
-    Rows arrive pipe-delimited (psql -tA), so multi-column callers split on "|".
-    """
     out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True).stdout
     return [r for r in out.strip().split("\n") if r != ""]
 
 
 def scalar(sql, default=0):
-    """Run a single-value query and return it as a float.
-
-    Falls back to `default` when the query returns nothing or something
-    unparseable, so a sampling loop survives the window where cuebot has not
-    yet created the rows being counted.
-    """
     r = q(sql)
     try:
         return float(r[0]) if r else default

@@ -60,13 +60,6 @@ SPEC_HEAD = ('<?xml version="1.0"?>\n'
 
 
 def make_job(name, pri, rng):
-    """Build the job spec XML for one job at priority `pri`.
-
-    Memory is deliberately light (1 GB/core) and maxcores generous so neither
-    can become the binding constraint -- the scenario is measuring priority,
-    and a job held back by RAM or a per-job cap would look like starvation
-    that priority never caused.
-    """
     n = rng.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(n):
@@ -86,11 +79,6 @@ def make_job(name, pri, rng):
 
 
 def _scalar(sql, cast, default):
-    """Run a single-value query and return it through `cast`, or `default`.
-
-    Failures yield `default` as an "unknown" sentinel so the injector keeps
-    feeding through transient DB trouble.
-    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=10).stdout.strip()
@@ -107,18 +95,11 @@ def waiting(token):
 
 
 def util_pct():
-    """Farm utilization from the host table's own core accounting."""
     return _scalar("SELECT COALESCE(100.0*(sum(int_cores)-sum(int_cores_idle))"
                    "/NULLIF(sum(int_cores),0),0) FROM host;", float, -1.0)
 
 
 def max_host_idle():
-    """Largest idle-core count on any single host, in whole cores.
-
-    The saturation check the injector feeds against: while some host still has
-    a sizeable idle block, the farm has room and priority is not yet being
-    tested. Only once this collapses does contention decide who books.
-    """
     return _scalar("SELECT COALESCE(MAX(int_cores_idle),0) FROM host;", int, -1) // \
         sim_model.CORE_POINTS
 
@@ -138,13 +119,6 @@ def submit_wave(stub, prefix, pri, seq):
 
 
 def main():
-    """Hold both priority classes oversupplied for DURATION.
-
-    Each class is independently topped back up to its own waiting target, so
-    neither can run dry -- if the low class exhausted its queue, its completion
-    rate would fall for reasons that have nothing to do with the scheduler
-    starving it, and the fairness verdict would be meaningless.
-    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

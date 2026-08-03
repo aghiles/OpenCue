@@ -66,7 +66,6 @@ SQL_SMALL_DONE = ("SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job 
 
 
 def q(sql):
-    """Run one SQL statement and return stripped stdout."""
     return subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                           timeout=15).stdout.strip()
 
@@ -91,12 +90,6 @@ def snapshot():
 
 
 def small_done():
-    """Completed small-frame count -- the farm-is-busy control.
-
-    Stranding only means something if the farm is working the whole time: big
-    frames sitting unbooked on an idle farm is a load problem, not a packing
-    one. Returns -1 if the count can't be read.
-    """
     try:
         return int(q(SQL_SMALL_DONE) or 0)
     except ValueError:
@@ -104,19 +97,11 @@ def small_done():
 
 
 def fmt(c):
-    """Render one class's state counts as a fixed-width wait/run/done line."""
     return (f"wait={c.get('WAITING',0):3d} run={c.get('RUNNING',0):3d} "
             f"done={c.get('SUCCEEDED',0):3d}")
 
 
 def main():
-    """Sample big-job progress for DURATION at equal and high priority.
-
-    Watches whether wide frames can ever assemble enough contiguous cores while
-    small frames keep the farm saturated. Priority is the second axis: if the
-    high-priority big job strands too, raising priority is not a workaround and
-    the scheduler needs to reserve rather than re-rank.
-    """
     print(f"watching BIG-job stranding for {DURATION}s "
           f"(equal vs high priority)\n", flush=True)
     print(f"{'t':>4}  {'small_done':>10}  | "

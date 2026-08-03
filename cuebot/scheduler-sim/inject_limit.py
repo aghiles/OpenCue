@@ -61,13 +61,6 @@ def ensure_limit():
 
 
 def make_job(name, rng):
-    """Build the job spec XML for one limited job.
-
-    Every layer requests exactly one core and carries the limit, so running
-    frames map one-to-one onto license units and the watcher's concurrency
-    count is directly comparable to the cap. Layer and frame counts come from
-    `rng`, which the caller seeds per job so a run is reproducible.
-    """
     n = rng.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(n):
@@ -87,12 +80,6 @@ def make_job(name, rng):
 
 
 def _scalar(sql, cast, default):
-    """Run a single-value query and return it through `cast`, or `default`.
-
-    The injector must keep feeding through transient DB trouble, so every
-    failure yields `default` -- a sentinel the caller treats as "unknown", not
-    as a real reading of zero.
-    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=10).stdout.strip()
@@ -109,18 +96,11 @@ def waiting():
 
 
 def util_pct():
-    """Farm utilization from the host table's own core accounting."""
     return _scalar("SELECT COALESCE(100.0*(sum(int_cores)-sum(int_cores_idle))"
                    "/NULLIF(sum(int_cores),0),0) FROM host;", float, -1.0)
 
 
 def submit_wave(stub, prefix, seq):
-    """Launch up to WAVE jobs, returning the sequence number reached.
-
-    A gRPC rejection means cuebot's launch queue is full, so the wave stops
-    early and backs off rather than retrying immediately -- hammering a full
-    queue would distort the very scheduler behaviour being measured.
-    """
     for _ in range(WAVE):
         seq += 1
         xml = SPEC_HEAD + make_job(f"{prefix}-{seq:05d}", random.Random(seq * 13)) + "</spec>\n"
@@ -133,13 +113,6 @@ def submit_wave(stub, prefix, seq):
 
 
 def main():
-    """Hold a steady oversupply of limited work for DURATION.
-
-    Tops the queue back up to TARGET waiting frames each tick rather than
-    submitting everything at once: the cap can only be shown to hold if demand
-    exceeds it continuously, and a single front-loaded burst would drain into a
-    backlog too small to test anything by the end of the run.
-    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

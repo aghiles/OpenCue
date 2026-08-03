@@ -23,10 +23,6 @@ INTERVAL = 5.0  # seconds between full ping rounds
 
 
 def render_host(name, cores, mem_kb):
-    """Build the RenderHost message describing one idle host.
-
-    Reports the host as fully free; keeping hosts UP is the pinger's only job.
-    """
     return report_pb2.RenderHost(
         name=name, facility=spec.FACILITY,
         num_procs=cores, cores_per_proc=spec.CORES_PER_PROC,
@@ -38,11 +34,6 @@ def render_host(name, cores, mem_kb):
 
 
 def ping_round(stub, hosts):
-    """Send one host report per host; return how many reports failed.
-
-    The fast variant reports on a shorter interval, for runs where hosts would
-    otherwise age out to DOWN before the next round reaches them.
-    """
     failed = 0
     for name, cores, mem_kb in hosts:
         cp = cores * spec.CORES_PER_PROC

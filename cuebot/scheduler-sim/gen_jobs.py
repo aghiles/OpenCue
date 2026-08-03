@@ -35,13 +35,6 @@ SPEC_HEAD = """<?xml version="1.0"?>
 
 
 def make_job(idx):
-    """Build the job spec XML for job `idx`.
-
-    Layer shapes -- core counts, memory, GPU-ness -- are drawn from sim_model
-    so the generated mix matches the farm model the rest of the harness
-    assumes. The caller seeds the RNG from `idx`, making the whole job set
-    reproducible and therefore comparable across scheduler modes.
-    """
     nlayers = random.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(nlayers):
@@ -81,12 +74,6 @@ def make_job(idx):
 
 
 def main():
-    """Submit NUM_JOBS generated jobs and report the demand they represent.
-
-    The totals printed at the end -- layers, frames and aggregate core demand
-    -- are what let a run be read against farm capacity afterward, so an
-    experiment can be judged on whether it actually oversubscribed the farm.
-    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=10)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

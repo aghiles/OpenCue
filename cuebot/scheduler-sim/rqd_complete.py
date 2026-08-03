@@ -112,13 +112,6 @@ def poll_new():
 
 
 def _send_completion(frame):
-    """Report one frame as finished, sometimes as an out-of-memory failure.
-
-    A fraction _MEM_FAILURE_RATE of completions exit with the OOM status
-    instead of success. Real farms kill frames this way constantly, and the
-    retry-and-rebook churn it produces is the load that exposes proc leaks --
-    a scheduler that only ever sees clean completions is not being tested.
-    """
     mem_fail = _MEM_FAILURE_RATE > 0 and random.random() < _MEM_FAILURE_RATE
     exit_status = _EXIT_MEM_FAILURE if mem_fail else 0
     report = report_pb2.FrameCompleteReport(
@@ -144,13 +137,6 @@ def _send_completion(frame):
 
 
 def _completion_loop():
-    """Report frames as complete once their simulated runtime elapses.
-
-    Frames are held in a min-heap keyed by due time, so the loop only wakes for
-    the earliest one instead of scanning everything outstanding -- which is
-    what keeps the reporter cheap when tens of thousands of frames are in
-    flight and its own cost would otherwise distort the run.
-    """
     while True:
         now = time.time()
         due = []
@@ -163,12 +149,6 @@ def _completion_loop():
 
 
 def _stats_loop():
-    """Print reporter throughput and backlog every 5s.
-
-    The pending-heap depth is the number that matters: if it grows steadily,
-    the reporter is falling behind and frames are finishing later than the
-    model says, which quietly biases every timing measurement in the run.
-    """
     while True:
         time.sleep(5)
         with _lock:
@@ -181,7 +161,6 @@ def _stats_loop():
 
 
 def main():
-    """Start the completion and stats threads and serve until killed."""
     grpc.channel_ready_future(grpc.insecure_channel(CUEBOT)).result(timeout=30)
     threading.Thread(target=_completion_loop, daemon=True).start()
     threading.Thread(target=_stats_loop, daemon=True).start()

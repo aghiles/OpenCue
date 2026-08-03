@@ -138,14 +138,6 @@ def wait_for_saturation():
 
 
 def make_big(name, pri, paused):
-    """Build the job spec XML for one wide (BIG_CORES) job.
-
-    Wide enough that only a substantially free host can take a frame, which is
-    the whole point: these are the frames that strand when a farm is packed
-    with small work. `paused` supports pre-creating the job and releasing it
-    later, so it starts contending at a controlled moment rather than at
-    submission time.
-    """
     cores_pts = BIG_CORES * sim_model.CORE_POINTS
     pflag = "true" if paused else "false"
     layer = (f'      <layer name="big" type="Render">'
@@ -211,13 +203,6 @@ def activate(stub, name):
 
 
 def main():
-    """Inject the wide jobs, either pre-created and paused or submitted live.
-
-    Pre-create mode exists so the big job is already known to cuebot before it
-    starts competing: releasing an existing paused job removes submission
-    latency from the measurement, leaving only the scheduler's decision to
-    account for how long the wide frames wait.
-    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

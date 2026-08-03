@@ -29,11 +29,6 @@ CSV = os.environ.get("SIM_FOLDER_CSV", "")
 
 
 def _int(sql, default=0):
-    """Run a single-value query and return it as an int, or `default`.
-
-    Any failure -- timeout, psql error, non-numeric output -- collapses to
-    `default` so a transient DB hiccup costs one sample, not the whole watch.
-    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -49,13 +44,6 @@ FOLDER = subprocess.run(
 
 
 def cap_cores():
-    """The folder's max-cores ceiling, in whole cores, or -1 if unset.
-
-    Stored as core-points, so it is divided down here to match the units every
-    other figure in this watcher reports. -1 passes through untouched: the
-    injector sets the cap shortly after the watcher starts, and the loop
-    re-reads until it appears.
-    """
     cp = _int(f"SELECT int_max_cores FROM folder_resource WHERE pk_folder='{FOLDER}';", -1)
     return cp // CP if cp > 0 else cp
 
@@ -68,12 +56,6 @@ def folder_cores():
 
 
 def waiting_cores():
-    """Cores the folder's queued frames are asking for, in whole cores.
-
-    This is the demand side of the cap check: holding running cores under the
-    ceiling proves nothing unless there was queued work that wanted to exceed
-    it, so the verdict reports INCONCLUSIVE when this never outgrows the cap.
-    """
     cp = _int(f"SELECT COALESCE(SUM(l.int_cores_min * ls.int_waiting_count),0) "
               f"FROM layer l JOIN layer_stat ls ON ls.pk_layer=l.pk_layer "
               f"JOIN job j ON l.pk_job=j.pk_job WHERE j.pk_folder='{FOLDER}';")
@@ -81,11 +63,6 @@ def waiting_cores():
 
 
 def main():
-    """Sample folder core usage for DURATION and print a cap verdict.
-
-    Tracks the peak of running cores against the folder's ceiling, alongside
-    the waiting-core backlog that establishes there was demand to cap.
-    """
     N = cap_cores()
     print(f"watching FOLDER {FOLDER[:8]} (cap {N} cores) for {DURATION}s: running "
           f"cores must stay <= cap.\n", flush=True)

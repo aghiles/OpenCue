@@ -49,12 +49,6 @@ import time
 # SIM_RUN_USER, else the user who sudo'd in (SUDO_USER), else the owner of this
 # checkout, so there is never a baked-in username like "ubuntu".
 def _default_run_user():
-    """Pick the non-root account the sim should run as.
-
-    Postgres and cuebot both refuse to run as root, so a run started with sudo
-    has to drop back to a real user. Falls back to whoever owns this file,
-    which is the person who checked the repo out.
-    """
     import pwd
     return (os.environ.get("SIM_RUN_USER")
             or os.environ.get("SUDO_USER")
@@ -118,16 +112,10 @@ PSQL = [f"{PGBIN}/psql", "-h", "127.0.0.1",
 
 
 def log(msg):
-    """Print a timestamped harness line.
-
-    The HH:MM:SS prefix is load-bearing: the analysis scripts anchor a run's
-    measurement window by scraping these stamps out of the log.
-    """
     print(f"[simulate {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def sh(cmd, **kw):
-    """Run a command to completion, capturing stdout and stderr as text."""
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
@@ -291,7 +279,6 @@ def set_fd_limit():
 
 
 def psql(sql, timeout=60):
-    """Run one SQL statement against the sim database."""
     return sh(PSQL + ["-c", sql], timeout=timeout)
 
 
@@ -333,7 +320,6 @@ def db_stats(sample_s=5):
 
 
 def port_open(port):
-    """Return True if something is listening on the given local port."""
     s = socket.socket()
     s.settimeout(1)
     try:
@@ -424,13 +410,6 @@ WORKLOAD_PATTERNS = ["feed.py", "inject_big.py", "inject_priority_starve.py",
 
 # ---------------------------------------------------------------- teardown
 def teardown():
-    """Kill anything left over from a previous run before starting a new one.
-
-    Order matters: workload helpers go first, then cuebot and RQD are verified
-    gone rather than merely signalled. A previous run's detached processes get
-    re-parented to init and survive an ordinary kill, and a surviving cuebot
-    would keep dispatching against the database this run is about to recreate.
-    """
     log("tearing down any previous run ...")
     # Kill workload + helpers first (best effort), then VERIFY cuebot/RQD are gone
     # (kill_until_gone re-checks and retries): a previous run's detached
@@ -479,18 +458,11 @@ def arm_cleanup():
 
 
 def _atexit_cleanup():
-    """Tear down spawned children on normal exit, if cleanup is armed."""
     if _cleanup_armed:
         cleanup_children()
 
 
 def _signal_cleanup(signum, _frame):
-    """Tear down spawned children on a stop signal, armed or not.
-
-    An interrupted run must never leave orphans behind, whatever mode it was
-    in -- they would hold ports and keep writing to the database, and the next
-    run would inherit the mess.
-    """
     # A stop signal ALWAYS tears down (armed or not): if the run is interrupted we
     # never want to leave orphans, whatever mode it was in.
     log(f"received signal {signum}; cleaning up sim children ...")
@@ -521,12 +493,6 @@ def _maint_psql(sql, db="postgres", timeout=120):
 
 
 def _psql_file(path, db="cuebot", user="cue", timeout=600):
-    """Run a SQL script file, aborting at the first error.
-
-    ON_ERROR_STOP matters for schema loads: without it psql reports success
-    having skipped the statements that failed, and the run continues against a
-    half-built schema that fails much later and far less legibly.
-    """
     return sh([f"{PGBIN}/psql", "-h", "127.0.0.1", "-p", str(PG_PORT),
                "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-q", "-f", path],
               timeout=timeout)
@@ -596,13 +562,6 @@ def ensure_database():
 
 
 def ensure_postgres():
-    """Bring up a byte-for-byte fresh postgres cluster for this run.
-
-    Always re-initdbs rather than reusing a cluster and deleting rows. Reuse
-    silently carries table bloat, an autovacuum backlog and a warm cache
-    across runs, which shifts DB latency between runs and makes two scheduler
-    modes incomparable for reasons that have nothing to do with scheduling.
-    """
     # ALWAYS start fresh. Stop any cluster left by a previous run and delete its
     # data dir, so every run re-initdbs a byte-for-byte clean cluster. Reusing a
     # cluster (the old behaviour: just DELETE the rows) silently carried table
@@ -708,7 +667,6 @@ def ensure_cuebot_built():
     env.pop("JAVA_TOOL_OPTIONS", None)   # NO private hosts file during the build
 
     def _assemble(extra):
-        """Run the gradle assemble with the given extra arguments."""
         return subprocess.run(cmd + extra, cwd=CUEBOT_DIR, env=env,
                               capture_output=True, text=True, timeout=1800)
 
@@ -776,13 +734,6 @@ def license_env(script=False):
 
 def start_cuebot(mode, reservations=False, block_seconds=60, max_fraction=0.5,
                  max_grantees=8, backfill=True, booking_off=False, frame_cores_max=0):
-    """Build and launch cuebot configured for one scheduler mode.
-
-    Every knob this exposes -- reservations, backfill, the grantee caps -- is
-    passed as a property rather than baked into a build, so "new" and "old"
-    runs execute the same binary and any difference between them is
-    attributable to configuration alone.
-    """
     # scheduler.enabled is a tri-state rollout switch: no | facility | managed
     # (back-compat true=facility/false=no). Default new->facility, else->no;
     # override with SIM_SCHEDULER_ENABLED (e.g. "managed" for per-show testing).
@@ -971,11 +922,6 @@ def write_sim_hosts_file():
 
 
 def spawn(script_args, logpath, env_extra=None):
-    """Start a harness helper in the background, logging to `logpath`.
-
-    The child is registered for cleanup so an interrupted run doesn't strand
-    injectors and watchers still writing to the database.
-    """
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
@@ -991,11 +937,6 @@ def spawn(script_args, logpath, env_extra=None):
 # leaves graphs behind without any manual sampling step. Override the directory
 # with SIM_GRAPH_DIR; the default is /tmp/scheduler-sim/<mode>-<timestamp>.
 def graph_dir_for(mode):
-    """Directory this run's CSVs and graphs are written to.
-
-    Defaults to a per-mode path so consecutive "new" and "old" runs don't
-    overwrite each other's samplers before the comparison is made.
-    """
     base = os.environ.get("SIM_GRAPH_DIR")
     if base:
         return base
@@ -1052,12 +993,6 @@ def generate_graphs(graph_dir, sampler_procs, tag="run"):
 
 
 def ensure_hosts(nhosts, expected):
-    """Register the farm if fewer hosts are present than the spec expects.
-
-    Utilization is a fraction of farm capacity, so a run that starts with a
-    partially registered farm reports percentages against the wrong
-    denominator -- silently, and in the flattering direction.
-    """
     if nhosts >= expected:
         log(f"hosts present ({nhosts})")
         return
@@ -1067,7 +1002,6 @@ def ensure_hosts(nhosts, expected):
 
 
 def start_fake_rqd(threads, mem_failure_rate=0.0):
-    """Start the fake RQD that accepts launches and reports completions."""
     log(f"starting fake RQD (reporter threads={threads}"
         + (f", mem_failure_rate={mem_failure_rate:.0%}" if mem_failure_rate > 0 else "")
         + ") ...")
@@ -1086,12 +1020,6 @@ def start_fake_rqd(threads, mem_failure_rate=0.0):
 
 
 def start_pinger(interval, expected):
-    """Start the host/frame status reporter and wait for hosts to report in.
-
-    Blocks until hosts are pinging because dispatch only considers hosts that
-    have reported recently: starting the workload first would measure a farm
-    that is still coming up.
-    """
     log(f"starting host+frame status reporter (rqd_report, interval={interval}s) ...")
     spawn(["rqd_report.py", str(interval)], PINGER_LOG)
     for _ in range(20):
@@ -1108,11 +1036,6 @@ def start_pinger(interval, expected):
 
 # ---------------------------------------------------------------- workload
 def submit_jobs(njobs, seed):
-    """Submit the deterministic starting backlog.
-
-    Seeded so every mode is handed byte-identical work; without that, two runs
-    differ by their job mix as much as by their scheduler.
-    """
     log(f"submitting {njobs} deterministic jobs (seed base {seed}) ...")
     code = (
         f"import sys,random; sys.path.insert(0,{FARM + '/opencue_proto'!r});"
@@ -1130,7 +1053,6 @@ def submit_jobs(njobs, seed):
 
 
 def start_feeder(duration, target):
-    """Start the paced feeder that holds the runnable backlog near `target`."""
     dep = int(os.environ.get("SIM_DEP_TREE_DEPTH", "3"))
     kind = f"dependency trees, depth {dep}" if dep >= 2 else "independent jobs"
     log(f"starting paced feeder (hold ~{target} runnable frames for {duration}s; {kind}) ...")
@@ -1138,11 +1060,6 @@ def start_feeder(duration, target):
 
 
 def _strand_env(cores, dur_mix):
-    """Environment overrides shared by the stranding injector and its watcher.
-
-    Both sides have to agree on frame width and duration mix, so the setting
-    is built once here rather than passed separately to each.
-    """
     env_extra = {"SIM_STRAND_CORES": str(cores)}
     if dur_mix:
         env_extra["SIM_STRAND_DUR_MIX"] = "1"
@@ -1163,7 +1080,6 @@ def precreate_big(duration, interval, cores=64, dur_mix=False):
 
 
 def start_big_injector(duration, interval, cores=64, dur_mix=False):
-    """Start the wide-job injector used by the stranding scenarios."""
     shape = ("two duration classes (short vs long per-frame time)" if dur_mix
              else "mixed equal/high priority")
     log(f"starting BIG-job injector (resume {cores}-core paused jobs every "
@@ -1173,7 +1089,6 @@ def start_big_injector(duration, interval, cores=64, dur_mix=False):
 
 
 def start_priority_starve_injector(duration, interval):
-    """Start the two-class injector for the priority-starvation scenario."""
     log(f"starting PRIORITY_STARVING injector (two paced streams: "
         f"pri{os.environ.get('SIM_PRI_HI','300')} HIGH vs "
         f"pri{os.environ.get('SIM_PRI_LO','100')} LOW; phase 1 saturates with HIGH, "
@@ -1183,7 +1098,6 @@ def start_priority_starve_injector(duration, interval):
 
 
 def start_priority_spread_injector(duration):
-    """Start the multi-class injector for the priority-spread scenario."""
     log(f"starting PRIORITY spread injector ({len(os.environ.get('SIM_SPREAD_PRIS','10,20,30,40,50,60,70,80,90,100').split(','))} "
         f"priority classes, no prefill, all contend from t=0, for {duration}s) ...")
     spawn(["inject_priority_spread.py", str(duration)],
@@ -1191,7 +1105,6 @@ def start_priority_spread_injector(duration):
 
 
 def start_limit_injector(duration):
-    """Start the injector that floods the farm with limit-capped work."""
     log(f"starting LIMIT injector (flood '{os.environ.get('SIM_LIMIT_NAME','simlic')}'"
         f"-limited frames, cap {os.environ.get('SIM_LIMIT_MAX','50')}, for {duration}s) ...")
     spawn(["inject_limit.py", str(duration)], f"{FARM}/inject_limit.log")
@@ -1207,7 +1120,6 @@ def start_license_server(duration):
 
 
 def start_license_injector(duration):
-    """Start the injector that submits license-bound layers plus a control."""
     log(f"starting LICENSE injector (layers declaring CUE_LICENSES: hengine "
         f"host-based, katana + maya floating, plus an unlicensed control, "
         f"for {duration}s) ...")
@@ -1215,7 +1127,6 @@ def start_license_injector(duration):
 
 
 def start_folder_injector(duration):
-    """Start the injector that floods the folder-capped show with work."""
     log(f"starting FOLDER injector (flood the sim folder, cap "
         f"{os.environ.get('SIM_FOLDER_MAX','50')} cores, for {duration}s) ...")
     spawn(["inject_folder.py", str(duration)], f"{FARM}/inject_folder.log")
@@ -1783,14 +1694,6 @@ def run_verify():
 
 
 def main():
-    """Run the simulator: bring up the stack, drive a scenario, report on it.
-
-    Handles the whole lifecycle -- drop root, raise the file-descriptor limit,
-    rebuild the database, start cuebot and the fake farm, run the requested
-    scenario or the full --verify suite, then graph and summarize. Teardown is
-    registered before anything is spawned, so an interrupt at any point still
-    leaves the machine clean.
-    """
     # If we're root, drop to a non-root user and re-run (postgres/cuebot refuse
     # root). For a normal user this is a no-op and nothing uses sudo.
     reexec_as_nonroot_if_needed()
@@ -2392,12 +2295,6 @@ def main():
         poison_ts = psql("SELECT now();").stdout.strip()
         cb_log = CUEBOT_LOG
         def _tickfails():
-            """Count scheduler tick failures logged by cuebot so far.
-
-            A tick that throws books nothing, so a run can look merely slow
-            when the scheduler is in fact partly dead; the verdict counts
-            these rather than inferring health from throughput alone.
-            """
             try:
                 return sum(1 for ln in open(cb_log, errors="ignore")
                            if "Scheduler tick failed" in ln)

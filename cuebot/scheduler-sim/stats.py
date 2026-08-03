@@ -17,27 +17,13 @@ DURATION = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 STEP = 3.0
 
 def q(sql):
-    """Run one SQL statement and return its non-empty result rows as strings.
-
-    Bounded at 20s so a wedged query fails the sample rather than hanging the
-    whole assessment run.
-    """
     out = subprocess.run(PSQL+["-c",sql], capture_output=True, text=True, timeout=20).stdout
     return [r for r in out.strip().split("\n") if r != ""]
 def scalar(sql, d=0):
-    """Run a single-value query and return it as a float, or `d` if unparseable."""
     r = q(sql)
     try: return float(r[0]) if r else d
     except ValueError: return d
 def reject_count():
-    """Count overbooking rejections cuebot has logged so far.
-
-    Scraped from the log rather than the DB because a rejected booking leaves
-    no row behind -- the host-resource trigger fires and the transaction rolls
-    back. Callers difference two readings to get a rate. Returns 0 if the log
-    is absent, which is the right answer for a run that has yet to reject
-    anything.
-    """
     try:
         return int(subprocess.run(["bash","-c","grep -c 'unable to allocate' /tmp/cuebot.log || true"],
                    capture_output=True, text=True).stdout.strip() or 0)

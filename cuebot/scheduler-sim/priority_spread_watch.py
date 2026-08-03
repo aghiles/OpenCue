@@ -38,11 +38,6 @@ CSV = os.environ.get("SIM_SPREAD_CSV", "")
 
 
 def token(pri):
-    """Job-name marker identifying a priority class.
-
-    Zero-padded so the token is a fixed width and a LIKE match on one class
-    can't also match another (pri 10 vs 100).
-    """
     return f"prispread{pri:03d}"
 
 
@@ -83,14 +78,6 @@ def spearman(pris, shares):
 
 
 def main():
-    """Sample all priority classes for DURATION and score monotonicity.
-
-    The verdict is Spearman rank correlation between configured priority and
-    completed-frame share across the classes, which must reach RHO_MIN. Rank
-    correlation rather than an absolute target because the scheduler is only
-    required to order the classes correctly -- it makes no promise about the
-    size of the gaps between them.
-    """
     print(f"watching PRIORITY-SPREAD for {DURATION}s: {len(PRIS)} classes "
           f"pri={PRIS}. Share of completed frames should rise with priority.\n",
           flush=True)

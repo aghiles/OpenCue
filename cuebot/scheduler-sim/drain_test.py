@@ -20,16 +20,9 @@ PSQL = spec.psql_cmd()
 SHOW = "10000000-0000-0000-0000-000000000003"
 
 def q(sql):
-    """Run one SQL statement and return stripped stdout."""
     return subprocess.run(PSQL+["-c",sql], capture_output=True, text=True, timeout=20).stdout.strip()
 
 def main():
-    """Submit the fixed backlog, then time how long the farm takes to drain it.
-
-    The backlog is seeded deterministically off SEED, so NEW and OLD schedulers
-    are handed byte-identical work and the drain time is directly comparable.
-    Polls until waiting+running reaches zero and prints the total.
-    """
     chan = grpc.insecure_channel(spec.GRPC)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

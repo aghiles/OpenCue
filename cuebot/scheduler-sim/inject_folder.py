@@ -41,11 +41,6 @@ SPEC_HEAD = ('<?xml version="1.0"?>\n'
 
 
 def _psql1(sql, cast=str, default=None):
-    """Run a single-value query and return it through `cast`, or `default`.
-
-    An empty result is treated as missing rather than cast, so a query run
-    before cuebot has created the row yields `default` instead of raising.
-    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -73,11 +68,6 @@ def setup_folder_cap():
 
 
 def make_job(name, rng):
-    """Build the job spec XML for one job in the capped folder.
-
-    Layer shapes come from `rng`, seeded per job by the caller so a run
-    reproduces exactly.
-    """
     n = rng.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(n):
@@ -95,28 +85,17 @@ def make_job(name, rng):
 
 
 def waiting():
-    """Dependency-free WAITING frames in this scenario's jobs.
-
-    The runnable backlog the feed loop tops back up, so demand stays above the
-    folder cap for the whole run.
-    """
     return _psql1(f"SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job "
                   f"WHERE j.str_name LIKE '%{TOKEN}%' AND f.str_state='WAITING' "
                   f"AND f.int_depend_count=0;", int, -1)
 
 
 def util_pct():
-    """Farm utilization from the host table's own core accounting."""
     return _psql1("SELECT COALESCE(100.0*(sum(int_cores)-sum(int_cores_idle))"
                   "/NULLIF(sum(int_cores),0),0) FROM host;", float, -1.0)
 
 
 def submit_wave(stub, prefix, seq):
-    """Launch up to WAVE jobs, returning the sequence number reached.
-
-    Stops the wave and backs off on a gRPC rejection, which means cuebot's
-    launch queue is full.
-    """
     for _ in range(WAVE):
         seq += 1
         xml = SPEC_HEAD + make_job(f"{prefix}-{seq:05d}", random.Random(seq * 17)) + "</spec>\n"
@@ -129,12 +108,6 @@ def submit_wave(stub, prefix, seq):
 
 
 def main():
-    """Hold the capped folder oversupplied with work for DURATION.
-
-    Tops the queue back up to TARGET waiting frames each tick so demand stays
-    above the folder's core ceiling continuously -- a cap only demonstrates
-    anything while there is queued work it is actively refusing.
-    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

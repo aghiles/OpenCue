@@ -53,19 +53,11 @@ SELECT cls, max(EXTRACT(EPOCH FROM (now()-ts_started)))::int FROM (
 
 
 def q(sql):
-    """Run one SQL statement and return stripped stdout."""
     return subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                           timeout=15).stdout.strip()
 
 
 def snapshot():
-    """Return (per-class frame-state counts, per-class oldest-waiting age).
-
-    Classes are "hi" and "lo", the two priority bands the scenario submits.
-    The age half is what detects starvation specifically: a low-priority band
-    can hold a healthy frame count while its oldest waiting frame ages without
-    bound, which is the failure the scenario exists to catch.
-    """
     counts = {"hi": {}, "lo": {}}
     age = {"hi": 0, "lo": 0}
     for line in q(SQL).splitlines():
@@ -80,18 +72,10 @@ def snapshot():
 
 
 def done(c):
-    """Completed-frame count from one class's state-count mapping."""
     return c.get("SUCCEEDED", 0)
 
 
 def main():
-    """Sample both priority classes for DURATION and judge fairness.
-
-    The verdict rests on per-class completion RATE, not on frames completed:
-    the high class is deliberately given more work, so raw totals always favor
-    it and would pass a scheduler that starves the low class outright. Oldest
-    waiting age is reported alongside as the starvation tell.
-    """
     print(f"watching PRIORITY fairness for {DURATION}s: HI=pri{PRI_HI} vs "
           f"LO=pri{PRI_LO} (ideal LO share ~{EXPECT_LO*100:.0f}%). Per-class "
           f"frames/s is the verdict; util / resv / backfill shown inline.\n",

@@ -23,12 +23,6 @@ INTERVAL = 15.0  # seconds between full ping rounds
 
 
 def render_host(name, cores, mem_kb):
-    """Build the RenderHost message describing one idle host.
-
-    Reports the host as fully free (free_mem == total_mem). The pinger's job is
-    to keep hosts marked UP, not to model load -- the running procs cuebot
-    already knows about are what determine actual availability.
-    """
     return report_pb2.RenderHost(
         name=name, facility=spec.FACILITY,
         num_procs=cores, cores_per_proc=spec.CORES_PER_PROC,
@@ -40,13 +34,6 @@ def render_host(name, cores, mem_kb):
 
 
 def ping_round(stub, hosts):
-    """Send one host report per host; return how many reports failed.
-
-    Hosts that miss reports for long enough get marked DOWN by cuebot and stop
-    being dispatched to, which would silently shrink the farm mid-run and
-    corrupt every utilization figure -- so failures are counted and surfaced
-    rather than ignored.
-    """
     failed = 0
     for name, cores, mem_kb in hosts:
         cp = cores * spec.CORES_PER_PROC

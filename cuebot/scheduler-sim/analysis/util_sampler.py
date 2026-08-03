@@ -22,12 +22,6 @@ PSQL = [f"{_BIN}/psql", "-tA", "-h", _HOST, "-p", _PORT, "-U", "cue", "-d", "cue
 
 
 def q(sql):
-    """Run one SQL statement through psql and return stripped stdout.
-
-    Errors collapse to an empty string so the sampler survives a database that
-    is still starting or momentarily unreachable; the caller treats a row that
-    doesn't split into the expected field count as a missed sample.
-    """
     return subprocess.run(PSQL + [sql], capture_output=True, text=True).stdout.strip()
 
 
