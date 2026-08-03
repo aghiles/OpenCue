@@ -94,6 +94,12 @@ def running_by_host():
 
 def render_host(name, cores, mem_kb, free_mem_kb, total_swap_kb, free_swap_kb,
                 gpus, gpu_mem_kb, free_gpu_mem_kb):
+    """Build the RenderHost message for one host at its current load.
+
+    Unlike the status pingers, free memory here is computed from what the
+    booked frames are actually modelled to be using, so cuebot sees memory
+    pressure build and relieve as it would on a real farm.
+    """
     return report_pb2.RenderHost(
         name=name, facility=spec.FACILITY,
         num_procs=cores, cores_per_proc=spec.CORES_PER_PROC,
@@ -106,6 +112,13 @@ def render_host(name, cores, mem_kb, free_mem_kb, total_swap_kb, free_swap_kb,
 
 
 def frame_info(rec, rss_kb, used_swap_kb, now):
+    """Build the RunningFrameInfo for one booked frame.
+
+    Reports the frame's modelled actual RSS, not its reservation. That gap is
+    the point: cuebot's OOM handling keys off reported usage, so a frame that
+    reserved generously but uses little must look cheap, and one that overruns
+    its reservation must look expensive enough to be killed.
+    """
     (proc_id, frame_id, job_id, job_name, frame_name, layer_id,
      core_pts, reserved_kb, gpus, gpu_mem_kb, ts_booked) = rec
     return report_pb2.RunningFrameInfo(
@@ -118,6 +131,7 @@ def frame_info(rec, rss_kb, used_swap_kb, now):
 
 
 def _send_one(stub, name, cores, mem_kb, frames, now):
+    """Send one host's report, including every frame it is running."""
     cp = cores * spec.CORES_PER_PROC
     gpus, gpu_mem_kb = spec.host_gpu(name, cores, mem_kb)
     booked_cp = sum(r[6] for r in frames)
@@ -186,6 +200,13 @@ def _send_one(stub, name, cores, mem_kb, frames, now):
 
 
 def ping_round(stub, pool):
+    """Report every host once, concurrently, and return the failure count.
+
+    Reports go out in parallel across REPORT_THREADS because a serialized
+    round takes as long as the sum of cuebot's per-report latencies -- on a
+    large farm that exceeds the interval itself, and hosts start aging toward
+    DOWN purely because the reporter cannot keep up.
+    """
     now = int(time.time())
     running = running_by_host()
     # Fire all host reports CONCURRENTLY (see REPORT_THREADS). gRPC channels are
@@ -199,6 +220,13 @@ def ping_round(stub, pool):
 
 
 def main():
+    """Report host and frame status continuously until killed.
+
+    Stands in for every RQD on the farm, so cuebot sees hosts stay UP and sees
+    running frames' real memory use. Rotates to the next configured cuebot
+    address when a whole round fails, which is what keeps the farm alive
+    through a leader kill in the FAILOVER scenario.
+    """
     # Cuebot failover, like a real RQD's multi-cuebot config: when a whole
     # report round fails (the cuebot we dial died -- e.g. the FAILOVER verify
     # scenario killing the leader), re-dial the next address from

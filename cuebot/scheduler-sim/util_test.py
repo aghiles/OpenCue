@@ -38,6 +38,13 @@ SQL = (
 
 
 def measure():
+    """Return (honest_util_pct, running_frames, leaked_procs).
+
+    Utilization counts only cores held by procs that back a running frame.
+    Procs with a NULL pk_frame hold cores while doing no work, so including
+    them would let a leaking scheduler report high utilization while the farm
+    accomplishes nothing -- they are returned separately as the leak signal.
+    """
     out = subprocess.run(spec.psql_cmd(tab=True) + ["-c", SQL],
                          capture_output=True, text=True, timeout=30).stdout.strip()
     farm, with_frame, procs_no_frame, running = [int(x) for x in out.split("\t")]
@@ -46,7 +53,12 @@ def measure():
 
 
 def kill_stack():
-    # Kill by matching the stack processes; avoid patterns that match this script.
+    """Tear down any leftover sim stack so a run starts from a clean slate.
+
+    Matches cuebot, the gradle daemon and the harness helpers by process name.
+    The patterns are chosen not to match this script itself, which would make
+    the teardown kill the run it is preparing for.
+    """
     subprocess.run(
         "ps -eo pid,args | grep -iE 'CuebotApplication|bootRun|GradleDaemon|"
         "fake_rqd|rqd_report|feed.py|simulate.py' | grep -v grep | "
@@ -56,6 +68,13 @@ def kill_stack():
 
 
 def main():
+    """Drive a sim run to a target utilization and report whether it got there.
+
+    Brings up the stack under the requested scheduler mode, feeds it until
+    utilization crosses --threshold, and reports the honest utilization
+    alongside the leaked-proc count -- the two have to be read together, since
+    a leak inflates any utilization figure that counts booked cores.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["new", "old"], default="new")
     ap.add_argument("--fill", type=int, default=200)

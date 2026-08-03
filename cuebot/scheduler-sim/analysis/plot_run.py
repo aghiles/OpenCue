@@ -23,6 +23,12 @@ TAG = sys.argv[2] if len(sys.argv) > 2 else "run"
 
 
 def load(path):
+    """Read a sampler CSV into a list of dict rows, or [] if it isn't there.
+
+    A missing file is normal rather than an error: each graph below is guarded
+    on its own input, so a run that skipped a sampler still produces the plots
+    it does have data for.
+    """
     if not os.path.exists(path):
         return []
     with open(path) as f:
@@ -259,6 +265,11 @@ if len(d) > 1:
     x = elapsed(d)
 
     def rate(col):
+        """Differentiate one cumulative dbstat column into a per-second rate.
+
+        Element 0 is 0.0 so the result stays index-aligned with the sample
+        list; zero-length intervals yield 0.0 rather than dividing by zero.
+        """
         vals = [int(r[col]) for r in d]
         out = [0.0]
         for i in range(1, len(vals)):

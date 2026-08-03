@@ -23,6 +23,12 @@ CSV = os.environ.get("SIM_LIMIT_CSV", "")
 
 
 def _scalar(sql, default=0):
+    """Run a single-value query and return it as an int, or `default`.
+
+    Every failure mode -- timeout, psql error, non-numeric output -- collapses
+    to `default` so a transient DB hiccup costs one sample instead of aborting
+    the watch and losing the verdict.
+    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -32,6 +38,12 @@ def _scalar(sql, default=0):
 
 
 def cap():
+    """Return the limit's configured ceiling, or -1 if the record doesn't exist.
+
+    -1 is meaningful rather than an error: the injector creates the
+    limit_record slightly after the watcher starts, so the loop re-reads this
+    each tick and only reports INCONCLUSIVE if it never appears.
+    """
     return _scalar(f"SELECT int_max_value FROM limit_record WHERE str_name='{LIMIT_NAME}';", -1)
 
 
@@ -46,6 +58,13 @@ def _limited_frames(state):
 
 
 def main():
+    """Sample limited-layer concurrency for DURATION and print a verdict.
+
+    Tracks two peaks: concurrent RUNNING frames (which the cap governs) and the
+    WAITING backlog (which establishes there was demand to cap at all). Both
+    are needed -- a run where nothing ever queued proves nothing, and is
+    reported INCONCLUSIVE rather than passed.
+    """
     N = cap()
     print(f"watching LIMIT '{LIMIT_NAME}' (cap {N}) for {DURATION}s: "
           f"concurrent running frames must stay <= cap.\n", flush=True)

@@ -49,6 +49,12 @@ SPEC_HEAD = ('<?xml version="1.0"?>\n'
   '  <user>sim</user>\n  <uid>9860</uid>\n')
 
 def waiting():
+    """Dependency-free WAITING frame count across the whole farm.
+
+    The feedback signal the feed loop throttles on: it submits only when this
+    falls below target, so the backlog is held roughly constant instead of
+    growing without bound over a long run.
+    """
     try:
         out = subprocess.run(PSQL+["-c","SELECT count(*) FROM frame WHERE str_state='WAITING' AND int_depend_count=0;"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
@@ -57,6 +63,11 @@ def waiting():
         return -1
 
 def make_job(name, rng):
+    """Build the job spec XML for one steady-state job.
+
+    Layer shapes come from sim_model, so the continuous feed keeps the same
+    mix of core sizes, memory and GPU layers the farm model assumes.
+    """
     n = rng.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(n):
@@ -131,6 +142,13 @@ def pending():
 
 
 def main():
+    """Keep the farm fed with work for the duration of a run.
+
+    Submits only when the runnable backlog drops below target, holding the
+    queue at a steady depth: a farm that runs dry stops measuring the
+    scheduler and starts measuring the feeder, and one fed without limit
+    buries the DB in frame rows that slow every query the watchers make.
+    """
     # Cuebot failover, like a real submission client (pycue takes a comma-
     # separated Cuebot host list): when a launch fails, rotate to the next
     # address from SIM_CUEBOT_GRPC_FALLBACKS so submissions keep flowing to

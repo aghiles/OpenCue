@@ -11,9 +11,17 @@ RUNS = [("new", "new (inline-dispose)", "#1f77b4"), ("rust", "rust", "#d62728")]
 WATCH = 185
 
 def sod(h):
+    """Convert an "HH:MM:SS" stamp to seconds-since-midnight."""
     a = list(map(int, h.split(":"))); return a[0]*3600 + a[1]*60 + a[2]
 
 def util_series(tag):
+    """Scrape (offset_seconds, util_pct) pairs from a run's sim log.
+
+    Offsets are relative to the first util line rather than to any absolute
+    clock, so two runs started minutes apart still overlay. Samples past WATCH
+    seconds are dropped so both curves cover the same span. Returns [] when the
+    log is missing or never logged utilization.
+    """
     rx = re.compile(r"\[(\d\d:\d\d:\d\d)\]\s*util=\s*([\d.]+)%"); pts = []
     try:
         for ln in open(f"{CMP}/{tag}_sim.log", errors="ignore"):
@@ -24,19 +32,34 @@ def util_series(tag):
     t0 = pts[0][0]; return [(t-t0, v) for t, v in pts if 0 <= t-t0 <= WATCH]
 
 def rows(tag):
+    """Parse a run's dbstat CSV into (seconds_since_midnight, [counters]).
+
+    Short or non-numeric rows are skipped rather than fatal: the sampler
+    appends and flushes live, so the last line of a run that was killed
+    mid-write is routinely a partial row.
+    """
     out = []
     try: f = open(f"{CMP}/{tag}_dbstat.csv", errors="ignore")
     except FileNotFoundError: return []
     f.readline()
     for ln in f:
         p = ln.strip().split(",")
-        if len(p) < 11: continue
-        try: out.append((sod(p[0]), [int(x) for x in p[1:11]]))
+        if len(p) < 13: continue
+        try: out.append((sod(p[0]), [int(x) for x in p[1:13]]))
         except ValueError: continue
     return out
-# cols after ts: 0 commits,1 rollbacks,2 tup_ret,3 tup_fetch,4 ins,5 upd,6 del,7 deadlocks,8 active,9 lockwait
+# cols after ts: 0 commits,1 rollbacks,2 tup_ret,3 tup_fetch,4 ins,5 upd,6 del,
+# 7 deadlocks,8 blks_read,9 blks_hit,10 active,11 lockwait
 
 def rates(tag):
+    """Difference a run's counters into per-second rates, keyed by metric.
+
+    pg_stat_database reports cumulative totals, so every counter column here
+    (reads, writes, rollbacks, deadlocks) is differenced against the previous
+    sample and divided by the elapsed time. The two gauges -- active backends
+    and lock-waiters -- are point-in-time already and pass through untouched.
+    Samples outside [0, WATCH+30] are dropped so the curves stay comparable.
+    """
     r = rows(tag)
     o = {k: [] for k in ("reads","writes","rollbacks","deadlocks","lockwait","active")}
     if not r: return o
@@ -57,6 +80,7 @@ def rates(tag):
 R = {t: rates(t) for t, _, _ in RUNS}
 
 def line(title, fname, ylabel, key):
+    """Plot one metric for every run on shared axes and write it to CMP."""
     plt.figure(figsize=(10,5))
     for tag, label, color in RUNS:
         s = R[tag][key]
@@ -82,7 +106,9 @@ plt.title("DB health / contention  (lock-waiting backends + rollback rate)")
 plt.tight_layout(); plt.savefig(f"{CMP}/g_health.png", dpi=110); plt.close(); print("wrote g_health.png")
 
 print("\n=== summary (mean / peak) ===")
-def st(s): v=[x[1] for x in s]; return (sum(v)/len(v), max(v)) if v else (0,0)
+def st(s):
+    """Return (mean, peak) of a (time, value) series, or (0, 0) if empty."""
+    v=[x[1] for x in s]; return (sum(v)/len(v), max(v)) if v else (0,0)
 for tag, label, _ in RUNS:
     u=st(util_series(tag)); rd=st(R[tag]["reads"]); wr=st(R[tag]["writes"])
     rb=st(R[tag]["rollbacks"]); lw=st(R[tag]["lockwait"]); dl=st(R[tag]["deadlocks"]); ac=st(R[tag]["active"])

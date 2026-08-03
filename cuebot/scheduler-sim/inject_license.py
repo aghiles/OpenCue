@@ -71,12 +71,23 @@ TOKEN = "simlicense"
 
 
 def _pick(rng):
+    """Draw one license flavour from FLAVOURS by weight.
+
+    The mix includes an unlicensed entry on purpose: it becomes the control
+    group the watcher checks is entirely unaffected by license pressure.
+    """
     names = [f for f, _ in FLAVOURS]
     weights = [w for _, w in FLAVOURS]
     return rng.choices(names, weights=weights, k=1)[0]
 
 
 def make_job(name, rng):
+    """Build the job spec XML for one job with per-layer license requirements.
+
+    Each layer draws its own flavour, so a single job can span several licenses
+    and the unlicensed control -- which is what forces the scheduler to gate
+    per layer rather than per job.
+    """
     n = rng.randint(LAYERS_MIN, LAYERS_MAX)
     layers = []
     for li in range(n):
@@ -100,6 +111,7 @@ def make_job(name, rng):
 
 
 def _scalar(sql, cast, default):
+    """Run a single-value query and return it through `cast`, or `default`."""
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=10).stdout.strip()
@@ -124,11 +136,17 @@ def licensed_running():
 
 
 def util_pct():
+    """Farm utilization from the host table's own core accounting."""
     return _scalar("SELECT COALESCE(100.0*(sum(int_cores)-sum(int_cores_idle))"
                    "/NULLIF(sum(int_cores),0),0) FROM host;", float, -1.0)
 
 
 def submit_wave(stub, prefix, seq):
+    """Launch up to WAVE jobs, returning the sequence number reached.
+
+    Stops the wave and backs off on a gRPC rejection, which means cuebot's
+    launch queue is full.
+    """
     for _ in range(WAVE):
         seq += 1
         xml = SPEC_HEAD + make_job(f"{prefix}-{seq:05d}", random.Random(seq * 13)) + "</spec>\n"
@@ -141,6 +159,12 @@ def submit_wave(stub, prefix, seq):
 
 
 def main():
+    """Hold the farm oversupplied with license-bound work for DURATION.
+
+    Demand has to exceed the available seats continuously for the scheduler's
+    gating to be under test at all, so the queue is topped back up to TARGET
+    each tick rather than submitted as one burst.
+    """
     chan = grpc.insecure_channel(CUEBOT)
     grpc.channel_ready_future(chan).result(timeout=15)
     stub = job_pb2_grpc.JobInterfaceStub(chan)

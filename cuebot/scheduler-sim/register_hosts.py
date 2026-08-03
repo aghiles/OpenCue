@@ -31,6 +31,12 @@ def bootstrap(chan):
     show_stub = show_pb2_grpc.ShowInterfaceStub(chan)
 
     def ok(fn, *a, **k):
+        """Call a create RPC, treating ALREADY_EXISTS as success.
+
+        This is what makes setup idempotent: re-running against a database
+        that already has the facility, allocation or show must be a no-op, but
+        any other RPC failure is still a real error and propagates.
+        """
         try:
             return fn(*a, **k)
         except grpc.RpcError as e:
@@ -63,6 +69,14 @@ def bootstrap(chan):
 
 
 def register_hosts(chan):
+    """Announce every host in the farm spec to cuebot via an RQD report.
+
+    Hosts enter the DB the same way real ones do -- an initial report from
+    RQD -- rather than by direct insert, so the rows carry whatever defaults
+    and side effects cuebot's own ingest path applies. Core counts are
+    converted to core-points and GPU attributes come from the farm spec, so
+    SIM_HOST_COUNTS and SIM_GPU shape the farm from one place.
+    """
     rqd = report_pb2_grpc.RqdReportInterfaceStub(chan)
     n = 0
     for name, cores, mem_kb in spec.all_hosts():

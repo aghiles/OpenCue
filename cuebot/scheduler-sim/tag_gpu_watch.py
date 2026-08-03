@@ -40,6 +40,11 @@ CSV = os.environ.get("SIM_TAGGPU_CSV", "")
 
 
 def _scalar(sql, default=0):
+    """Run a single-value query and return it as an int, or `default`.
+
+    Any failure collapses to `default` so a transient DB hiccup costs one
+    sample rather than the whole watch.
+    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -49,6 +54,12 @@ def _scalar(sql, default=0):
 
 
 def tag_violations():
+    """Count procs placed on a host whose tags don't match the layer's.
+
+    The word-boundary match mirrors cuebot's own tag matching, so a layer
+    tagged "cap1" is not satisfied by a host tagged "cap10". Any non-zero
+    result is a placement bug and fails the scenario.
+    """
     return _scalar(
         "SELECT count(*) FROM proc p "
         "JOIN layer l ON l.pk_layer = p.pk_layer "
@@ -58,6 +69,11 @@ def tag_violations():
 
 
 def gpu_host_violations():
+    """Count GPU-requiring procs placed on hosts that have no GPU at all.
+
+    The coarsest possible GPU placement error, kept separate from the
+    oversubscription check so a failure says which of the two broke.
+    """
     return _scalar(
         "SELECT count(*) FROM proc p "
         "JOIN layer l ON l.pk_layer = p.pk_layer "
@@ -66,6 +82,12 @@ def gpu_host_violations():
 
 
 def gpu_oversub_hosts():
+    """Count hosts whose procs reserve more GPU units or GPU memory than exist.
+
+    Sums reservations per host and compares against that host's capacity, so
+    it catches the case where each placement is individually legal but their
+    total exceeds the hardware -- the failure mode a per-proc check misses.
+    """
     return _scalar(
         "SELECT count(*) FROM ("
         "  SELECT p.pk_host, SUM(p.int_gpus_reserved) sg, "
@@ -77,17 +99,35 @@ def gpu_oversub_hosts():
 
 
 def negative_idle_hosts():
+    """Count hosts whose idle GPU counters have gone negative.
+
+    A direct accounting check on the booking path: idle counters are
+    decremented on reserve and incremented on release, so a negative value
+    means a release ran twice or a reserve was double-counted. This can be
+    true even when no individual placement looks wrong.
+    """
     return _scalar("SELECT count(*) FROM host "
                    "WHERE int_gpus_idle < 0 OR int_gpu_mem_idle < 0;")
 
 
 def gpu_running():
+    """Count currently running procs that belong to GPU-requiring layers.
+
+    The coverage floor for the GPU half of the scenario -- the placement
+    checks above pass vacuously if no GPU work ever got booked.
+    """
     return _scalar("SELECT count(*) FROM proc p "
                    "JOIN layer l ON l.pk_layer = p.pk_layer "
                    "WHERE l.int_gpus_min > 0;")
 
 
 def tags_running():
+    """Count distinct capability tags currently represented by running procs.
+
+    The coverage floor for the tag half: the scenario requires every tag class
+    to be in play, so a scheduler that quietly served only one of them can't
+    pass on the violation count alone.
+    """
     return _scalar("SELECT count(DISTINCT l.str_tags) FROM proc p "
                    "JOIN layer l ON l.pk_layer = p.pk_layer "
                    "WHERE l.str_tags LIKE 'cap%';")
@@ -110,6 +150,12 @@ def gpu_utilization():
 
 
 def main():
+    """Sample tag and GPU placement for DURATION and print a verdict.
+
+    Four safety checks (tag match, GPU-host match, per-host oversubscription,
+    negative idle counters) must hold at every sample, and three coverage
+    floors must be met so the safety checks aren't passing on an empty farm.
+    """
     print(f"watching TAGS_GPU for {DURATION}s: tag + GPU placement must never "
           f"violate, GPU mem never oversubscribed; floors gpu>={MIN_GPU}, "
           f"tags=={NTAGS}.\n", flush=True)

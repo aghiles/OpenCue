@@ -33,6 +33,11 @@ MIN_STARTED = int(os.environ.get("SIM_DEPEND_MIN_STARTED", "200"))
 
 
 def _scalar(sql, default=0):
+    """Run a single-value query and return it as an int, or `default`.
+
+    Any failure collapses to `default` so a transient DB hiccup costs one
+    sample rather than the whole watch.
+    """
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -42,15 +47,23 @@ def _scalar(sql, default=0):
 
 
 def violations():
+    """Count frames running despite unsatisfied depends -- the correctness bug.
+
+    Any value above zero, at any single sample, fails the scenario outright:
+    this is a safety property, so unlike the throughput metrics it is never
+    averaged or given a tolerance.
+    """
     return _scalar("SELECT count(*) FROM frame "
                    "WHERE str_state='RUNNING' AND int_depend_count > 0;")
 
 
 def satisfied():
+    """Count depends that have been satisfied and deactivated so far."""
     return _scalar("SELECT count(*) FROM depend WHERE b_active=false;")
 
 
 def depend_total():
+    """Count depend records in the database, satisfied or not."""
     return _scalar("SELECT count(*) FROM depend;")
 
 
@@ -61,10 +74,19 @@ def depender_started():
 
 
 def depend_frames():
+    """Count frames currently held in the DEPEND state."""
     return _scalar("SELECT count(*) FROM frame WHERE str_state='DEPEND';")
 
 
 def main():
+    """Sample dependency correctness for DURATION and print a verdict.
+
+    Combines a safety check with two coverage floors. The safety check -- no
+    frame ever RUNNING with a non-zero depend count -- is what can fail the
+    run. The floors exist because that check passes trivially on a run where
+    nothing was ever gated, so the scenario also requires that depends were
+    actually satisfied and that gated frames actually started afterward.
+    """
     print(f"watching DEPENDS for {DURATION}s: no frame may ever RUN with "
           f"unsatisfied depends; coverage floors satisfied>={MIN_SATISFIED}, "
           f"gated-frames-started>={MIN_STARTED}.\n", flush=True)

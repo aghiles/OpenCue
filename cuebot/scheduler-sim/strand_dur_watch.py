@@ -56,6 +56,7 @@ SQL_SMALL_DONE = ("SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job 
 
 
 def q(sql):
+    """Run one SQL statement and return stripped stdout."""
     return subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                           timeout=15).stdout.strip()
 
@@ -76,6 +77,11 @@ def snapshot():
 
 
 def small_done():
+    """Completed small-frame count -- the farm-is-busy control.
+
+    Establishes that any short-class stall is starvation by the long class
+    rather than an idle farm. Returns -1 if the count can't be read.
+    """
     try:
         return int(q(SQL_SMALL_DONE) or 0)
     except ValueError:
@@ -83,11 +89,20 @@ def small_done():
 
 
 def fmt(c):
+    """Render one class's state counts as a fixed-width wait/run/done line."""
     return (f"wait={c.get('WAITING',0):3d} run={c.get('RUNNING',0):3d} "
             f"done={c.get('SUCCEEDED',0):4d}")
 
 
 def main():
+    """Sample short- vs long-frame wide jobs for DURATION and judge fairness.
+
+    Both classes are equally wide, so the only difference is frame duration.
+    That isolates a specific reservation hazard: cores freed by short frames
+    turn over fast enough to keep re-filling, and a scheduler that accumulates
+    for the long class can hold cores idle while doing so. Reservation grants
+    are printed inline so the trade-off is visible without grepping the log.
+    """
     print(f"watching wide-job DURATION fairness for {DURATION}s "
           f"(short-frame vs long-frame wide jobs); util / frames-s / reservation "
           f"grants are reported inline so nothing needs grepping afterward\n",

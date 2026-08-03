@@ -98,6 +98,12 @@ _state = {
 
 
 def _rows(sql):
+    """Run a query and return its rows already split into field lists.
+
+    Tab-separated so a value containing a comma or pipe can't split wrong.
+    Returns [] on any failure -- the server must keep answering polls even
+    when the DB is briefly unreachable.
+    """
     try:
         out = subprocess.run(PSQL + ["-t", "-A", "-F", "\t", "-c", sql],
                              capture_output=True, text=True, timeout=15).stdout
@@ -160,6 +166,14 @@ def sampler(t0):
 
 
 def licenses_payload():
+    """Build the seat-availability document cuebot polls.
+
+    Seat usage is derived from what the farm is actually running, so the
+    server behaves like a real vendor daemon watching the same processes
+    rather than a mock echoing back whatever cuebot asked for. Includes seats
+    held outside the farm, which is what makes availability drop for reasons
+    the scheduler cannot see or control.
+    """
     with _lock:
         frames = dict(_state["farm_frames"])
         hosts = {k: list(v) for k, v in _state["farm_hosts"].items()}
@@ -223,7 +237,15 @@ def state_payload():
 
 
 class Handler(BaseHTTPRequestHandler):
+    """HTTP handler exposing the license server's two read-only endpoints."""
+
     def do_GET(self):  # noqa: N802 (http.server API)
+        """Serve /licenses (what cuebot polls) or /state (what the watcher checks).
+
+        Two endpoints on purpose: the watcher must be able to read the
+        server's own belief without going through the same document the
+        scheduler consumes, so the two can be compared independently.
+        """
         if self.path.startswith("/licenses"):
             body = json.dumps(licenses_payload()).encode()
         elif self.path.startswith("/state"):
@@ -238,10 +260,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *a):
+        """Silence per-request logging."""
         pass  # cuebot polls every few seconds; do not spam the log
 
 
 def main():
+    """Start the farm sampler and serve the license endpoints until killed."""
     t0 = time.time()
     th = threading.Thread(target=sampler, args=(t0,), daemon=True)
     th.start()

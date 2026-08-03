@@ -82,16 +82,25 @@ FROM (
 
 
 def q(sql):
+    """Run one SQL statement and return stripped stdout (tab-separated)."""
     return subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                           timeout=20).stdout.strip()
 
 
 def rows(sql):
+    """Run a query and return its rows already split into field lists."""
     out = q(sql)
     return [line.split("\t") for line in out.split("\n") if line]
 
 
 def main():
+    """Print a live per-interval view of farm state and DB load for DURATION.
+
+    Each tick reports both levels and rates: the rates come from differencing
+    the previous sample's cumulative counters, so the first tick shows levels
+    only. Parse failures skip the tick rather than ending the run -- the
+    queries race cuebot's own schema setup early on.
+    """
     print(f"[live_stats] every {INTERVAL:.0f}s for {DURATION}s", flush=True)
     t_end = time.time() + DURATION
     prev = None        # (t, succeeded, running, xact_commit, tup_returned)

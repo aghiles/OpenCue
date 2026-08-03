@@ -81,6 +81,12 @@ MAX_RETRIES = int(os.environ.get("SIM_LIC_MAX_RETRIES", "0"))
 
 
 def _rows(sql):
+    """Run a query and return its rows already split into field lists.
+
+    Tab-separated (-F) rather than the default pipe because license names are
+    themselves comma-joined in one column, and a delimiter that can't appear in
+    the data keeps the split unambiguous. Returns [] on any failure.
+    """
     try:
         out = subprocess.run(PSQL + ["-t", "-A", "-F", "\t", "-c", sql],
                              capture_output=True, text=True, timeout=15).stdout
@@ -90,6 +96,7 @@ def _rows(sql):
 
 
 def _scalar(sql, default=0):
+    """Run a single-value query and return it as an int, or `default`."""
     try:
         out = subprocess.run(PSQL + ["-c", sql], capture_output=True, text=True,
                              timeout=15).stdout.strip()
@@ -99,6 +106,13 @@ def _scalar(sql, default=0):
 
 
 def server_state():
+    """Fetch the fake license server's view of seats, or {} if unreachable.
+
+    Deliberately the server's own belief rather than the DB's: the scenario
+    compares this against what the farm is really running, and the check only
+    means something if the two are gathered independently. An unreachable
+    server yields {} so the watch keeps sampling the farm side.
+    """
     try:
         with urllib.request.urlopen(STATE_URL, timeout=5) as r:
             return json.loads(r.read().decode())
@@ -143,17 +157,29 @@ def unlicensed_running():
 
 
 def waiting_backlog():
+    """Dependency-free WAITING frames in this scenario's jobs.
+
+    Demand that is ready to run right now, so a seat cap holding concurrency
+    down can be distinguished from simply having no work left to book.
+    """
     return _scalar(f"SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job "
                    f"WHERE j.str_name LIKE '%{TOKEN}%' AND f.str_state='WAITING' "
                    f"AND f.int_depend_count=0;")
 
 
 def dead_frames():
+    """DEAD frames in this scenario's jobs -- the retry-burn check.
+
+    A license denial must cost the frame nothing: it goes back to WAITING with
+    its retry budget intact. Frames reaching DEAD mean denials were being
+    charged as failures, which exhausts retries on a farm that is merely busy.
+    """
     return _scalar(f"SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job "
                    f"WHERE j.str_name LIKE '%{TOKEN}%' AND f.str_state='DEAD';")
 
 
 def succeeded():
+    """Completed frames in this scenario's jobs -- the progress floor."""
     return _scalar(f"SELECT count(*) FROM frame f JOIN job j ON f.pk_job=j.pk_job "
                    f"WHERE j.str_name LIKE '%{TOKEN}%' AND f.str_state='SUCCEEDED';")
 
@@ -184,6 +210,15 @@ def retries_spent():
 
 
 def main():
+    """Sample license seat usage for DURATION and print a verdict.
+
+    The core check compares what the farm is actually running, counted from the
+    frame table, against each license's seat count as the vendor server reports
+    it -- two independent sources, so agreement is evidence rather than
+    tautology. Alongside it run the retry-burn check (denials must not consume
+    a frame's retry budget) and an unlicensed control group that must be
+    entirely unaffected.
+    """
     st = server_state()
     if not st:
         print(f"watching LICENSE: cannot reach the license server at {STATE_URL}",

@@ -70,6 +70,11 @@ def frames_running():
 
 
 def host_count():
+    """Live host count, used as the fallback denominator for chance.
+
+    Only consulted when the farm spec doesn't supply a total, since the
+    expected-hit baseline is meaningless if the host count is wrong.
+    """
     try:
         out = subprocess.run(PSQL + ["-c", "SELECT count(*) FROM host;"],
                              capture_output=True, text=True, timeout=15).stdout.strip()
@@ -79,6 +84,16 @@ def host_count():
 
 
 def main_frames():
+    """Sample frame-start affinity for DURATION and report locality lift.
+
+    A frame start counts as a hit when its layer was already running on that
+    host at the previous sample. The raw hit rate can't be judged on its own --
+    a farm with few hosts or a job that fills the farm produces hits by
+    coincidence -- so each start also contributes its warmth-blind probability
+    to an expected-hits total, and the verdict is the lift of observed over
+    expected. Measuring starts rather than steady-state placement is what keeps
+    the comparison fair to both schedulers.
+    """
     nhosts = TOTAL_HOSTS or host_count() or 1
     print(f"watching LOCALITY (frame-start affinity, fair to both schedulers) "
           f"for {DURATION}s over {nhosts} hosts: a frame START counts as a hit "
@@ -229,6 +244,13 @@ def procs():
 
 
 def main():
+    """Run the locality watch in whichever mode SIM_LOCALITY_MODE selects.
+
+    "frames" measures frame-start affinity and only reports; the default refill
+    mode gates on a minimum hit rate among newly booked procs whose layer was
+    already running somewhere. Both skip WARMUP seconds first, since an empty
+    farm has no warm hosts to prefer and would drag the rate down.
+    """
     if MODE == "frames":
         main_frames()
         return

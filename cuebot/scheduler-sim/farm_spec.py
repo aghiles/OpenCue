@@ -166,10 +166,18 @@ def all_hosts():
 
 
 def total_cores():
+    """Total physical cores across the farm, honoring SIM_HOST_COUNTS.
+
+    This is the denominator every utilization figure in the harness divides by,
+    so it must track the same HOST_TYPES table the hosts are registered from --
+    a small-farm override that changed one and not the other would silently
+    rescale every reported percentage.
+    """
     return sum(count * cores for _, count, cores, _, _ in HOST_TYPES)
 
 
 def total_hosts():
+    """Total host count across the farm, honoring SIM_HOST_COUNTS."""
     return sum(count for _, count, _, _, _ in HOST_TYPES)
 
 

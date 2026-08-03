@@ -139,6 +139,14 @@ def _claim(frame_id):
 
 
 def _send_completion(frame, due_time, killed=False):
+    """Report one frame as finished, with the right failure status.
+
+    `killed` marks a frame cuebot explicitly OOM-killed; otherwise a memory
+    failure may be injected at the configured rate. License denials are
+    reported separately and only for frames not already failing for memory,
+    since the two paths get different treatment -- memory failures raise the
+    layer's reservation and bypass the retry cap, denials must cost nothing.
+    """
     # A real OOM kill (killed) reports a memory failure; otherwise inject one at
     # the configured rate. Either way cuebot raises the layer's memory and retries.
     mem_fail = killed or (_MEM_FAILURE_RATE > 0 and random.random() < _MEM_FAILURE_RATE)
@@ -180,6 +188,11 @@ def _send_completion(frame, due_time, killed=False):
 
 
 def _completion_loop():
+    """Report frames as complete once their simulated runtime elapses.
+
+    Frames wait in a min-heap keyed by due time so the loop only ever inspects
+    the earliest, keeping the cost flat as the number in flight grows.
+    """
     while True:
         now = time.time()
         due = []
@@ -196,7 +209,22 @@ def _completion_loop():
 
 
 class RqdServicer(rqd_pb2_grpc.RqdInterfaceServicer):
+    """The RQD gRPC surface cuebot dispatches to, for the whole fake farm.
+
+    One servicer stands in for every host: cuebot cannot tell the difference,
+    because the only thing it can observe is that launches are accepted and
+    completions come back on time.
+    """
+
     def LaunchFrame(self, request, context):
+        """Accept a frame and schedule its completion for later.
+
+        Returns as soon as the frame is queued -- a real RQD acknowledges the
+        launch and runs the work asynchronously, and blocking here would add
+        latency to cuebot's dispatch loop that no real farm imposes. Runtime
+        comes from sim_model, with job-name markers overriding it so a
+        scenario can pin specific frames long or short.
+        """
         global _seq
         rf = request.run_frame
         dur = sim_model.duration_seconds(rf.num_cores)
@@ -226,6 +254,13 @@ class RqdServicer(rqd_pb2_grpc.RqdInterfaceServicer):
         return rqd_pb2.RqdStaticLaunchFrameResponse()
 
     def KillRunningFrame(self, request, context):
+        """Honor cuebot's kill: complete the frame now as a memory failure.
+
+        Claiming the frame is what makes this mutually exclusive with its
+        pending natural completion, so a frame killed just before it would
+        have finished reports exactly once. Reporting twice would credit a
+        completion that never happened and corrupt the throughput count.
+        """
         # Honor cuebot's memory kill: cancel the frame's pending natural completion
         # and report it complete now with a memory failure, like a real RQD killing
         # an OOM frame. cuebot already preset the DB to EXIT_STATUS_MEMORY_FAILURE
@@ -238,10 +273,17 @@ class RqdServicer(rqd_pb2_grpc.RqdInterfaceServicer):
         return rqd_pb2.RqdStaticKillRunningFrameResponse()
 
     def GetRunningFrameStatus(self, request, context):
+        """Return an empty status; frame state is reported by rqd_report.py."""
         return rqd_pb2.RqdStaticGetRunningFrameStatusResponse()
 
 
 def _stats_loop():
+    """Print launch/completion throughput and ack latency every 5s.
+
+    Average ack time is the self-check: once it climbs, this fake RQD has
+    become the bottleneck and cuebot's dispatch rate is being limited by the
+    harness rather than by the scheduler under test.
+    """
     while True:
         time.sleep(5)
         with _heap_lock:
@@ -263,6 +305,7 @@ def _stats_loop():
 
 
 def serve():
+    """Start the RQD gRPC server plus its completion and stats threads."""
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=64))
     rqd_pb2_grpc.add_RqdInterfaceServicer_to_server(RqdServicer(), server)
     server.add_insecure_port(f"[::]:{RQD_PORT}")
