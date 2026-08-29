@@ -29,6 +29,7 @@ The frame retries on the next scheduling tick; memory failures bypass cuebot's
 max-retry guard so a frame always gets another chance.
 """
 import os
+import re
 import sys
 import time
 import heapq
@@ -78,6 +79,16 @@ def _failover_report_stub():
 _heap = []            # (due_time, seq, RunningFrameInfo)
 _heap_lock = threading.Lock()
 _seq = 0
+# SIM_RSS_PIN must bind completion reports too. The pinger (rqd_report.py)
+# already pins live rss, but the completion max_rss feeds the layer
+# high-water and the memory balancer. A pin honored on one path and not the
+# other splits the evidence into two truths, and every consumer that mixes
+# them drifts off the pinned value.
+_RSS_PINS = []
+for _part in os.environ.get("SIM_RSS_PIN", "").split(","):
+    if "=" in _part:
+        _tok, _gb = _part.split("=", 1)
+        _RSS_PINS.append((_tok.strip(), int(float(_gb) * 1024 * 1024)))
 # Frames that are running and not yet reported complete. The single source of
 # truth for "is this frame still alive": both the natural-completion path and an
 # OOM kill claim a frame from here, so whichever fires first wins and each frame
@@ -128,6 +139,14 @@ _EXIT_LICENSE_DENIED = int(os.environ.get("SIM_LIC_DENY_STATUS", "203"))
 # jobs get starved by long ones holding their reserved hosts. Tunable via env.
 _DUR_SHORT_S = float(os.environ.get("SIM_DUR_SHORT_S", "12"))
 _DUR_LONG_S = float(os.environ.get("SIM_DUR_LONG_S", "120"))
+
+# Squeeze slowdown model (SQUEEZE scenario). "sqzwork<N>" in a job name
+# declares N cores of WORK per frame; the frame's duration then scales with
+# the cores actually granted: base * N / granted. Fewer cores, proportionally
+# longer, so a squeezed booking is never a free lunch and the scenario must
+# prove a NET throughput win. Fixed base like durlong, deterministic.
+_SQZWORK_RE = re.compile(r"sqzwork(\d+)")
+_DUR_SQZ_BASE_S = float(os.environ.get("SIM_DUR_SQZ_BASE_S", "24"))
 
 
 def _claim(frame_id):
@@ -205,12 +224,22 @@ class RqdServicer(rqd_pb2_grpc.RqdInterfaceServicer):
             dur = _DUR_LONG_S
         elif "durshort" in jn:
             dur = _DUR_SHORT_S
+        else:
+            sq = _SQZWORK_RE.search(jn)
+            if sq:
+                want = int(sq.group(1))
+                got = max(1, rf.num_cores // sim_model.CORE_POINTS)
+                dur = _DUR_SQZ_BASE_S * want / got
         # Peak actual RSS from the real per-core map: a per-LAYER baseline plus a
         # small per-frame wobble (deterministic by layer + frame id so it matches
         # rqd_report.py for the same frame). num_cores is booked core-points
         # (100 == 1 core), the key the memory map is defined on.
         fcores = max(1, rf.num_cores // sim_model.CORE_POINTS)
         peak = sim_mem.peak_rss_kb(fcores, rf.frame_id, rf.layer_id)
+        for _tok, _pin_kb in _RSS_PINS:
+            if _tok in jn:
+                peak = _pin_kb
+                break
         frame = report_pb2.RunningFrameInfo(
             resource_id=rf.resource_id, job_id=rf.job_id, job_name=rf.job_name,
             frame_id=rf.frame_id, frame_name=rf.frame_name, layer_id=rf.layer_id,

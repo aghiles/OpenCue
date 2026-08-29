@@ -46,7 +46,7 @@ MIN_GROUPS = int(os.environ.get("SIM_TAGMAX_MIN_GROUPS", "80"))
 # same line (see Scheduler.maybeLogStat).
 STAT_RE = re.compile(
     r"Scheduler stat:.*?groups=(\d+).*?"
-    r"flow committed=(\d+) planned=(\d+) raceLost=(\d+)")
+    r"flow committed=(\d+) planned=(\d+)(?: squeezed=\d+)? raceLost=(\d+)")
 
 
 def parse_log():

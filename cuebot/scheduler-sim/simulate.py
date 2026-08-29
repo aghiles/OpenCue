@@ -407,7 +407,11 @@ WORKLOAD_PATTERNS = ["feed.py", "inject_big.py", "inject_priority_starve.py",
                      "inject_prodenv.py", "prodenv_watch.py",
                      "inject_layercap.py", "layercap_watch.py",
                      "inject_layercap_solo.py", "layercap_solo_watch.py",
+                     "inject_squeeze.py", "squeeze_watch.py",
+                     "inject_squeeze_flat.py", "squeeze_flat_watch.py",
+                     "inject_overdeclare.py", "overdeclare_watch.py",
                      "inject_strandgrow.py", "strandgrow_watch.py",
+                     "inject_underdeclare.py", "underdeclare_watch.py",
                      "inject_doublerender.py", "doublerender_watch.py",
                      "health_watch.py",
                      "live_stats.py",
@@ -1148,6 +1152,13 @@ def start_strandgrow_injector(duration):
           f"{FARM}/inject_strandgrow.log")
 
 
+def start_underdeclare_injector(duration):
+    log(f"starting UNDERDECLARE flood (4G-declared layers really holding "
+        f"18G, asks 1 and 4 cores, + honest control) for {duration}s ...")
+    spawn(["inject_underdeclare.py", str(duration)],
+          f"{FARM}/inject_underdeclare.log")
+
+
 def start_doublerender_injector(duration):
     log(f"starting DOUBLERENDER (stale unfenced frame-stop on running "
         f"frames; real sweep + rebook decide the verdict) for {duration}s ...")
@@ -1159,6 +1170,28 @@ def start_layercap_injector(duration):
     log(f"starting LAYERCAP flood (one deep 1-core layer; the cap must stop it "
         f"from blanketing any host, for {duration}s) ...")
     spawn(["inject_layercap.py", str(duration)], f"{FARM}/inject_layercap.log")
+
+
+def start_overdeclare_injector(duration):
+    log(f"starting OVERDECLARE workload (16G declared, 2G real; the legacy "
+        f"balancer must heal the lie) for {duration}s ...")
+    spawn(["inject_overdeclare.py", str(duration)],
+          f"{FARM}/inject_overdeclare.log")
+
+
+def start_squeeze_flat_injector(duration):
+    log(f"starting SQUEEZE_FLAT workload (tenant holes + a flat-memory 50G "
+        f"flood; squeezed under-reservations must not start kill cycles) "
+        f"for {duration}s ...")
+    spawn(["inject_squeeze_flat.py", str(duration)],
+          f"{FARM}/inject_squeeze_flat.log")
+
+
+def start_squeeze_injector(duration):
+    log(f"starting SQUEEZE flood (wide 16-core/64G frames vs holes just "
+        f"under the ask) for {duration}s ...")
+    spawn(["inject_squeeze.py", str(duration)],
+          f"{FARM}/inject_squeeze.log")
 
 
 def start_layercap_solo_injector(duration):
@@ -1440,12 +1473,18 @@ def _verify_check(name, gdir, logp, cblog):
             txt = ""
         m = re.search(r"Spearman rho\(priority, share\) = ([\-\d.]+)", txt)
         rho = float(m.group(1)) if m else 0.0
-        # Waitlist cross-check: a 9x-oversubscribed farm must classify its
-        # backlog as 'capacity' (idle cores drained, farm simply full).
+        # Waitlist cross-check: a 9x-oversubscribed farm must read as full on
+        # the waitlist. Before the squeeze that meant 'capacity' (idle cores
+        # drained below one frame). With the squeeze the widest class books
+        # into sub-ask holes instead of waiting, so the farm packs deeper and
+        # what remains idle is crumbs no frame fits: the full signal now lands
+        # in 'capacity' or 'no fit', whichever the leftover shape earns.
         wl = wl_peaks()
-        ok = bool(re.search(r"(?m)^PASS:", txt)) and wl["capacity"] > 0
+        full_peak = wl["capacity"] + wl["nofit"]
+        ok = bool(re.search(r"(?m)^PASS:", txt)) and full_peak > 0
         return ok, (f"share ordered by priority (Spearman rho={rho:.2f}); "
-                    f"waitlist capacity peak {wl['capacity']}")
+                    f"waitlist full peak {full_peak} "
+                    f"(capacity {wl['capacity']}, no fit {wl['nofit']})")
     if name == "RESERVATIONS":
         # A reservation only counts if it RESCUES the stranded wide job -- its
         # frames must actually run. reservedCores>0 alone is hollow: a drain that
@@ -1541,6 +1580,54 @@ def _verify_check(name, gdir, logp, cblog):
                     f"{pm.group(1) if pm else '?'} frames on "
                     f"{pm.group(2) if pm else '?'} hosts, "
                     f"{om.group(1) if om else '?'} hosts over cap")
+    if name == "OVERDECLARE_BAL":
+        # The watcher's verdict is the whole check: the lying declaration
+        # heals to observed truth, the b_optimize=false guard and the honest
+        # control keep their contracts, and the farm repacks cores-bound.
+        try:
+            txt = open(logp, errors="ignore").read()
+        except Exception:
+            txt = ""
+        fm = re.search(r"flood mem-min (\d+)G", txt)
+        gm = re.search(r"guard mem-min (\d+)G", txt)
+        um = re.search(r"peak util ([0-9.]+)%", txt)
+        ok = bool(re.search(r"(?m)^PASS:", txt))
+        return ok, (f"16G lie vs the balancer: flood healed to "
+                    f"{fm.group(1) if fm else '?'}G, guard kept "
+                    f"{gm.group(1) if gm else '?'}G, peak util "
+                    f"{um.group(1) if um else '?'}%")
+    if name == "SQUEEZE_FLAT":
+        # The watcher's verdict carries the check: zero kills, memory-short
+        # holes un-squeezed, cores-short holes still squeezing, no ratchet.
+        try:
+            txt = open(logp, errors="ignore").read()
+        except Exception:
+            txt = ""
+        km = re.search(r"kills (\d+);", txt)
+        am = re.search(r"squeezed-on-memory-short ever (\d+)", txt)
+        bm = re.search(r"peak squeezed-on-cores-short (\d+)", txt)
+        ok = bool(re.search(r"(?m)^PASS:", txt))
+        return ok, (f"flat 50G vs squeeze: kills {km.group(1) if km else '?'},"
+                    f" memory-short squeezes {am.group(1) if am else '?'}, "
+                    f"cores-short peak {bm.group(1) if bm else '?'}")
+    if name == "SQUEEZE":
+        # The watcher's verdict is the whole check: holes just under the ask
+        # book at >=80% of it, utilization crosses the bar, the 80% floor is
+        # never breached, and the win is net of the squeeze slowdown.
+        try:
+            txt = open(logp, errors="ignore").read()
+        except Exception:
+            txt = ""
+        um = re.search(r"peak util ([0-9.]+)%", txt)
+        sm = re.search(r"peak squeezed procs (\d+)", txt)
+        fm = re.search(r"under-floor procs (\d+)", txt)
+        dm = re.search(r"done rate ([0-9.]+)/s", txt)
+        ok = bool(re.search(r"(?m)^PASS:", txt))
+        return ok, (f"holes vs 16-core ask: peak util "
+                    f"{um.group(1) if um else '?'}%, squeezed procs "
+                    f"{sm.group(1) if sm else '?'}, under-floor "
+                    f"{fm.group(1) if fm else '?'}, done "
+                    f"{dm.group(1) if dm else '?'}/s")
     if name == "STRANDGROW":
         # The watcher's verdict is the whole check: memory-heavy threadable
         # frames book at their metric share, the non-threadable control does
@@ -1559,6 +1646,26 @@ def _verify_check(name, gdir, logp, cblog):
                     f"{fm.group(4) if fm else '?'} frames, ctrl max "
                     f"{cm.group(1) if cm else '?'}, peak core util "
                     f"{um.group(1) if um else '?'}%")
+    if name == "UNDERDECLARE":
+        # The watcher's verdict is the whole check: host-OOM kills bounded to
+        # the pre-evidence window, both arms converged to the metric share,
+        # late reservations honest, control untouched.
+        try:
+            txt = open(logp, errors="ignore").read()
+        except Exception:
+            txt = ""
+        km = re.search(r"kills total (\d+) \(flood1 (\d+), flood4 (\d+), "
+                       r"ctrl (\d+)\), late90 (\d+)", txt)
+        lm = re.search(r"late50 at (\d+): f1 (\d+)% f4 (\d+)%", txt)
+        sm = re.search(r"started (\d+)", txt)
+        ok = bool(re.search(r"(?m)^PASS:", txt))
+        return ok, (f"4G-declared 18G-real flood: "
+                    f"{km.group(1) if km else '?'} oom kills, "
+                    f"{km.group(5) if km else '?'} in the last 90s; late "
+                    f"launches at {lm.group(1) if lm else '?'} pts "
+                    f"(f1 {lm.group(2) if lm else '?'}%, "
+                    f"f4 {lm.group(3) if lm else '?'}%) over "
+                    f"{sm.group(1) if sm else '?'} started frames")
     if name == "DOUBLERENDER":
         # The watcher's verdict is the whole check: after the injected stale
         # frame-stop, the swept corpse's render must be killed, not left to
@@ -1888,6 +1995,69 @@ def run_verify():
         ("STRANDGROW", ["--hosts", "3,4,10",
                         "--strandgrow-test", str(max(D, 240))],
          {"SIM_RSS_PIN": "simstrandgrow=18"}),
+        # SQUEEZE: stranding at frame granularity, on the FULL farm (its
+        # shape mix is close to production). 100 jobs of threadable
+        # 16-core/56G frames: larges and mediums pack completely, but the
+        # small tier (65% of machines) misses the ask by half a gigabyte and
+        # can never fit it. The scheduler may book a frame at down to 80% of
+        # its cores, memory scaled alike (15c/52.5G fits a small); fake_rqd
+        # runs squeezed frames proportionally longer (sqzwork16), so the
+        # PASS is net of the slowdown. The watcher derives every threshold
+        # from the host table. Fail-first: util sticks near 72%, zero procs
+        # under the full ask, the whole small tier stranded.
+        ("SQUEEZE", ["--squeeze-test", str(max(D, 300))],
+         # Pinned 52G under a 56G declaration: the realistic over-declared
+         # wide layer. The squeeze fits holes against the TRUE footprint,
+         # so the small tier still books at 15 cores with zero overrun.
+         {"SIM_RSS_PIN": "simsqueeze=52"}),
+        # SQUEEZE_FLAT: the squeeze vs a layer whose memory does NOT shrink
+        # with fewer threads. Twelve small hosts; tenants carve memory-short
+        # holes (1c/7G) and cores-short holes (3c/2G); a flat 50G flood
+        # (declared 14c so the resize confirms its shape) squeezes into both.
+        # The memory-short squeeze reserves 46.4G under a 50G footprint:
+        # hosts tip over physical, the host-OOM balancer kills, the frame
+        # requeues into the reopened hole. Fail-first: the kill cycle plus
+        # the layer-ask ratchet. Fixed: squeeze memory floors at the rss
+        # evidence, memory-short holes stay empty, cores-short still book.
+        ("SQUEEZE_FLAT", ["--hosts", "0,0,12", "--cuebots", "1",
+                          "--squeeze-flat-test", str(max(D, 300))],
+         # A third of this tiny farm is stranded by design (the memory-short
+         # holes), so its churn ceiling sits under the global floor.
+         {"SIM_RSS_PIN": "simfltx=50,simfltena=7,simfltenb=2",
+          "SIM_DUR_LONG_S": "900", "SIM_VERIFY_MIN_DONE": "40"}),
+        # OVERDECLARE_BAL: the mirror disease and the legacy balancer's job.
+        # Non-threadable 1-core layers declare 16G but hold 2G (pinned), so
+        # the farm packs memory-bound at ~22% of its cores until the restored
+        # balanceLayerMinMemory call in the batched drain lowers int_mem_min
+        # to observed + 256M after the first successes. An honest 2G control
+        # must stay untouched and a b_optimize=false guard must never shrink.
+        # Full farm; the watcher derives the utilization bar from the host
+        # table. Fail-first: mem-min stays 16G, util stuck at the plateau.
+        ("OVERDECLARE_BAL", ["--overdeclare-test", str(max(D, 300))],
+         {"SIM_RSS_PIN": "simoverdecl=2"}),
+        # UNDERDECLARE: STRANDGROW's sibling, the other production disease.
+        # Layers declare 4G but their frames really hold 18G. Placement
+        # reserves the declaration, hosts oversubscribe, spill to swap, and
+        # cuebot's host-OOM logic kills the hogs. The rss ledger must bound
+        # the massacre to the pre-evidence window: later placements reserve
+        # the true 18G and book the metric share (500 pts). Two arms: the
+        # 1-core ask rides the probe gate; the 4-core explicit ask is never
+        # gated, so its first wave is the full burst and only the ledger can
+        # stop it. An honest non-threadable control must never be harmed.
+        # Fail-first: kills repeat all run for every fresh 4G wave.
+        # One cuebot on purpose: the rss ledger is in memory per instance,
+        # so a mid-run leader change makes the new leader book at the ask
+        # again until its own ledger fills. That is real, but it is the
+        # FAILOVER scenario's territory; this scenario tests the ledger.
+        # 40 small hosts on purpose: 4000 waiting balloons against ~520
+        # first-wave slots concentrate by arithmetic, so the disease needs
+        # no background workload; and after convergence the honest 18G
+        # shape fits three frames per small, so the late window books
+        # legally (a bg-saturated farm can only be entered by squeezed
+        # under-reservations, which the evidence floor now refuses).
+        ("UNDERDECLARE", ["--hosts", "0,0,40", "--cuebots", "1",
+                          "--underdeclare-test", str(max(D, 480))],
+         {"SIM_RSS_PIN": "simunderdecl_flood=18"}),
         # DOUBLERENDER: the release-path defect found by audit. A stale
         # lostProc (maintenance walking a minutes-old proc list) stops a frame
         # that was already released and rebooked -- the stop is unfenced, so
@@ -2034,10 +2204,13 @@ def run_verify():
         # completions prove work flowed, so a scenario that completes almost
         # nothing FAILS no matter how clean its invariant looked.
         done, rate = _verify_throughput(gdir)
-        if done < min_done:
+        # A scenario whose design idles part of the farm on purpose may carry
+        # its own floor in its env entry; the global default stands otherwise.
+        floor = int(env_extra.get("SIM_VERIFY_MIN_DONE", min_done))
+        if done < floor:
             ok = False
             detail += (f"; THROUGHPUT FAIL: only {done} frames completed "
-                       f"({rate:.1f}/s, floor {min_done}) -- the farm was not "
+                       f"({rate:.1f}/s, floor {floor}) -- the farm was not "
                        f"working, so the check above proves nothing")
         else:
             detail += f"; {done} frames done ({rate:.1f}/s)"
@@ -2066,7 +2239,38 @@ def main():
     ensure_grpc_interpreter()
     ensure_buildable()
     ensure_proto_stubs()
-    ap = argparse.ArgumentParser(description="One-command fresh scheduler sim")
+    ap = argparse.ArgumentParser(description="One-command fresh scheduler sim",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""\
+verify scenarios (python simulate.py --verify runs them all; SIM_VERIFY_ONLY=NAME[,NAME] a subset):
+  PRODENV           chaotic admin mutations mid-run; resource mirrors stay correct, no tick fails
+  OOM               memory failures bump the layer per frame and frames retry
+  PRIORITY          completion share is ordered by priority across 10 classes
+  PRIORITY_STARVING a low-priority stream survives a high-priority flood (3% floor)
+  RESERVATIONS      stranded wide jobs are rescued by reservations and actually run
+  LIMIT             a global limit cap holds concurrent frames at the cap
+  CAPDROP           a cap lowered under load converges without wedging the mirrors
+  LAYERCAP          contended one-layer flood: the per-host layer cap holds, zero violations
+  LAYERCAP_SOLO     the same flood alone: the soft cap yields and the farm fills
+  STRANDGROW        18G 1-core layers grow to their metric core share; control stays 1-core
+  SQUEEZE           holes just under an ask book one frame at >=80% of it, a net win
+  SQUEEZE_FLAT      a flat-memory layer squeezed into memory-short holes must not cause kill cycles
+  OVERDECLARE_BAL   a 16G lie over 2G real heals via the legacy balancer; b_optimize=false never shrinks
+  UNDERDECLARE      a 4G lie under 18G real: kills stop when the rss ledger converges
+  DOUBLERENDER      a stale release is fenced: no frame ever renders on two hosts
+  HEALTH            planted host sickness shows on the farm-health metrics per shape and group
+  LICENSE           live app licenses: pools never oversubscribe, seats shared, denials requeued
+  LICENSE_NO_HOSTS  same with a counts-only provider (the sesictrl shape)
+  POISON            orphaned procs mid-run: booking survives, the sweep cleans up
+  DEADLOCK          the memory balancer vs the completion drain: deadlocks held at zero
+  FOLDER            a folder core ceiling holds the folder at its cap
+  PARITY_OLD/NEW    fixture archetypes book under contention on the legacy and new paths alike
+  LOCALITY          refills return to hosts already running the layer (bonus on vs off)
+  DEPENDS           no frame ever runs with unsatisfied depends; depends do satisfy
+  FAILOVER          the leader dies mid-run; the standby books and accepts submissions
+  TAGS_GPU          tags and a GPU slice fragment the farm: zero placement violations
+  TAGMAX            120 tags shatter the farm: cross-group dedup keeps raceLost tiny
+
+Run --verify unmodified; scenarios are tuned and changed flags mislead. Details: README.md""")
     ap.add_argument("--mode", choices=["new", "old", "rust"], default="new",
                     help="new=cuebot's E-PVM planner; old=legacy cuebot booking; "
                          "rust=the standalone cue-scheduler binary "
@@ -2130,7 +2334,7 @@ def main():
                          "0.1s flood from 1553 hosts (~10 reports/host/s, ~100x a "
                          "real farm) overruns the host-report handler (~200ms DB "
                          "work each), completions back up, frames pile up in RUNNING "
-                         "holding cores, util pegs at 100% and throughput collapses; "
+                         "holding cores, util pegs at 100%% and throughput collapses; "
                          "5s keeps it ahead. rust's cuebot has booking OFF (it only "
                          "drains completions via rqd_complete through the same "
                          "handler), so it absorbs the 0.1s cadence fine and that is "
@@ -2212,6 +2416,14 @@ def main():
                          "18G -> 5 cores) so the hosts' cores work instead of "
                          "stranding behind exhausted memory; a "
                          "non-threadable control must stay at 1 core.")
+    ap.add_argument("--underdeclare-test", type=int, default=0,
+                    metavar="SECS",
+                    help="UNDERDECLARE test: layers declare 4G but their "
+                         "frames really hold 18G. Host-OOM kills must stay "
+                         "inside the pre-evidence window, then placements "
+                         "reserve the true rss and book the metric core "
+                         "share (1-core arm probe-gated, 4-core arm "
+                         "corrected but never gated).")
     ap.add_argument("--doublerender-test", type=int, default=0,
                     metavar="SECS",
                     help="DOUBLERENDER test: inject the stale unfenced "
@@ -2230,6 +2442,21 @@ def main():
                          "on an idle farm must go past the per-host layer "
                          "cap (contention rule, nobody waiting) and reach "
                          "high core utilisation instead of stranding.")
+    ap.add_argument("--overdeclare-test", type=int, default=0, metavar="SECS",
+                    help="OVERDECLARE test: 16G-declared/2G-real layers must "
+                         "have their int_mem_min healed by the legacy balancer, "
+                         "which the batched drain still feeds through the "
+                         "post-complete path; guard and control arms keep "
+                         "their contracts.")
+    ap.add_argument("--squeeze-flat-test", type=int, default=0, metavar="SECS",
+                    help="SQUEEZE_FLAT test: a flat-memory 50G flood squeezed "
+                         "into memory-short holes must not start host-OOM "
+                         "kill cycles; cores-short holes must keep booking "
+                         "squeezed frames.")
+    ap.add_argument("--squeeze-test", type=int, default=0, metavar="SECS",
+                    help="SQUEEZE test: wide memory-heavy frames vs holes just "
+                         "under their ask; holes must book at >=80%% of the ask "
+                         "(memory scaled alike) for a NET throughput win.")
     ap.add_argument("--health-test", type=int, default=0, metavar="SECS",
                     help="HEALTH test: assert the cue_farm_health_* Prometheus "
                          "family reports the fake farm's deterministic health "
@@ -2283,7 +2510,7 @@ def main():
                          "procs whose layer already ran somewhere, the fraction "
                          "landing on a host already running that layer. Needs a "
                          "churning farm: pair with --feed. PASS gate "
-                         "SIM_LOCALITY_MIN_HIT (default 0.15; calibrated ON~29% vs OFF~1.3% full-farm); disable the bonus "
+                         "SIM_LOCALITY_MIN_HIT (default 0.15; calibrated ON~29%% vs OFF~1.3%% full-farm); disable the bonus "
                          "for a control run with SIM_LOCALITY_ENABLED=false.")
     ap.add_argument("--depend-test", type=int, default=0, metavar="SECS",
                     help="DEPENDS test: with the feeder's dependency trees, assert "
@@ -2350,8 +2577,8 @@ def main():
                          "dispatcher.frame_cores_max clamp so the frame keeps its "
                          "full width.")
     ap.add_argument("--verify", action="store_true",
-                    help="SELF-TEST: run the OOM, priority and reservation "
-                         "scenarios back-to-back -- each a fresh, fully-torn-down "
+                    help="SELF-TEST: run the full scenario battery (list below) "
+                         "back-to-back -- each a fresh, fully-torn-down "
                          "sim that also writes its own graphs -- and print a "
                          "PASS/FAIL summary. Per-scenario seconds from "
                          "SIM_VERIFY_SECONDS (default 180); exits nonzero if any "
@@ -2590,8 +2817,16 @@ def main():
         start_layercap_injector(args.layercap_test)
     if args.layercap_solo_test:
         start_layercap_solo_injector(args.layercap_solo_test)
+    if args.squeeze_test:
+        start_squeeze_injector(args.squeeze_test)
+    if args.overdeclare_test:
+        start_overdeclare_injector(args.overdeclare_test)
+    if args.squeeze_flat_test:
+        start_squeeze_flat_injector(args.squeeze_flat_test)
     if args.strandgrow_test:
         start_strandgrow_injector(args.strandgrow_test)
+    if args.underdeclare_test:
+        start_underdeclare_injector(args.underdeclare_test)
     if args.doublerender_test:
         start_doublerender_injector(args.doublerender_test)
     if lic_secs:
@@ -2618,9 +2853,10 @@ def main():
     watch = (args.strand or args.priority_starve or args.priority_spread
              or args.limit_test or args.license_test or args.poison_test
              or args.capdrop_test or args.prodenv_test or args.layercap_test
-             or args.layercap_solo_test
+             or args.layercap_solo_test or args.squeeze_test or args.overdeclare_test
+             or args.squeeze_flat_test
              or args.health_test or args.strandgrow_test
-             or args.doublerender_test
+             or args.underdeclare_test or args.doublerender_test
              or args.folder_test or args.locality_test
              or args.depend_test or args.failover_test or args.tag_gpu_test
              or args.tagmax_test
@@ -2655,6 +2891,24 @@ def main():
             f"for {args.layercap_test}s ...")
         subprocess.run([VENV_PY, "layercap_watch.py", str(args.layercap_test), "3"],
                        cwd=FARM)
+    elif args.overdeclare_test:
+        log(f"watching OVERDECLARE (the 16G lie vs the balancer) for "
+            f"{args.overdeclare_test}s ...")
+        csv = f"{graph_dir}/run_overdeclare.csv" if graph_dir else ""
+        subprocess.run([VENV_PY, "overdeclare_watch.py",
+                        str(args.overdeclare_test), "3"],
+                       cwd=FARM, env=dict(os.environ, SIM_OVERDECLARE_CSV=csv))
+    elif args.squeeze_flat_test:
+        log(f"watching SQUEEZE_FLAT (flat 50G footprint vs squeezed "
+            f"under-reservation) for {args.squeeze_flat_test}s ...")
+        subprocess.run([VENV_PY, "squeeze_flat_watch.py",
+                        str(args.squeeze_flat_test), "3"], cwd=FARM)
+    elif args.squeeze_test:
+        log(f"watching SQUEEZE (holes vs the 80% squeeze floor) for "
+            f"{args.squeeze_test}s ...")
+        csv = f"{graph_dir}/run_squeeze.csv" if graph_dir else ""
+        subprocess.run([VENV_PY, "squeeze_watch.py", str(args.squeeze_test), "3"],
+                       cwd=FARM, env=dict(os.environ, SIM_SQUEEZE_CSV=csv))
     elif args.layercap_solo_test:
         log(f"watching LAYERCAP_SOLO (lone flood vs the stranding cap) "
             f"for {args.layercap_solo_test}s ...")
@@ -2665,6 +2919,11 @@ def main():
             f"core grant) for {args.strandgrow_test}s ...")
         subprocess.run([VENV_PY, "strandgrow_watch.py",
                         str(args.strandgrow_test), "5"], cwd=FARM)
+    elif args.underdeclare_test:
+        log(f"watching UNDERDECLARE (4G-declared 18G-real frames vs the rss "
+            f"ledger) for {args.underdeclare_test}s ...")
+        subprocess.run([VENV_PY, "underdeclare_watch.py",
+                        str(args.underdeclare_test), "5"], cwd=FARM)
     elif args.doublerender_test:
         log(f"watching DOUBLERENDER (swept corpse proc vs its still-running "
             f"render) for {args.doublerender_test}s ...")

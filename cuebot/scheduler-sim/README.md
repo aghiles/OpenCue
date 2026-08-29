@@ -46,19 +46,35 @@ torn-down sim that writes its own graphs — then prints a PASS/FAIL summary
 
 | scenario | asserts |
 |---|---|
-| **OOM** | memory failures bump the layer's memory per-frame (no legacy ratchet) and frames retry |
-| **PRIORITY** | completion share is *ordered by priority* across 10 classes (Spearman rho) |
-| **PRIORITY_STARVING** | a low-priority stream survives a high-priority flood (stays above a 3% floor) |
-| **RESERVATIONS** | stranded wide jobs are rescued by reservations + backfill and actually run |
-| **LIMIT** | a global license cap (`limit_record.int_max_value`) holds concurrent running frames at the cap under a deep backlog |
-| **LICENSE** | LIVE application licenses (hengine host-based, katana + maya floating) served by a fake license server that counts the farm's own usage AND artist holds: no pool ever oversubscribed, seats shared on host-based pools, unlicensed control unaffected, artists get seats mid-run (headroom), denials requeued with zero retries |
-| **LICENSE_NO_HOSTS** | same, but the provider reports only COUNTS (no `hosts` list) — the realistic `sesictrl` shape for Houdini: cuebot must bound new seats by `available` while blind to holders outside the cue |
-| **FOLDER** | a folder/group core ceiling (`folder_resource.int_max_cores`) holds the folder's running cores at the cap under a deep backlog |
-| **LOCALITY** | the same-layer locality bonus steers refills: newly booked procs land on hosts already running their layer (refill affinity above a calibrated floor; near-random without the bonus) |
-| **DEPENDS** | dependency correctness: no frame ever RUNS with unsatisfied depends, while depends satisfy and previously-gated frames run (coverage floors) |
-| **FAILOVER** | HA / leader election: the leader cuebot is killed mid-run and the standby takes over booking AND keeps accepting submissions (all clients re-dial the survivor like a real farm's multi-cuebot config) |
-| **TAGS_GPU** | one mixed run where capability tags AND a GPU slice fragment the farm at once: zero tag/GPU placement violations, GPUs and GPU memory never oversubscribed, every tag pool still runs work |
-| **TAGMAX** | the planner's cross-group layer dedup under maximal fragmentation: 120 capability tags shatter the full farm into host-spec groups while 30% of layers are run-anywhere (`general`, a candidate in every group at once), and `raceLost` (planned frames that lost the `frame.int_version` race at commit) must stay a small fraction of planned — proof no layer is re-planned across groups only to lose every copy but one |
+| **PRODENV** | chaotic admin changes mid-run; the scheduler's resource counters stay correct, no tick fails |
+| **OOM** | memory failures raise the layer's memory per frame and frames retry |
+| **PRIORITY** | completion share is ordered by priority across 10 classes |
+| **PRIORITY_STARVING** | a low-priority stream survives a high-priority flood (3% floor) |
+| **RESERVATIONS** | stranded big jobs are rescued by reservations and actually run |
+| **LIMIT** | a global limit cap holds concurrent frames at the cap |
+| **CAPDROP** | a cap lowered under load converges; no counter sticks |
+| **LAYERCAP** | contended one-layer flood: the per-host layer cap holds, zero violations |
+| **LAYERCAP_SOLO** | the same flood alone: the soft cap yields and the farm fills |
+| **STRANDGROW** | 18G one-core layers get cores to match their memory; the control stays one core |
+| **SQUEEZE** | a host almost fits the requested cores: a frame books at 80% or more, a net throughput win |
+| **SQUEEZE_FLAT** | a layer whose memory does not shrink with its cores: hosts short on memory stay empty, zero kills |
+| **OVERDECLARE_BAL** | a 16G claim over 2G real heals; the do-not-optimize flag always wins |
+| **UNDERDECLARE** | a 4G claim under 18G real: kills stop once the scheduler learns the real use |
+| **DOUBLERENDER** | a late duplicate start is blocked: no frame ever renders on two hosts |
+| **HEALTH** | planted host sickness shows on the farm health metrics per shape and group |
+| **LICENSE** | live app licenses: pools never oversubscribe, seats shared, denials requeued |
+| **LICENSE_NO_HOSTS** | same with a counts-only provider (the sesictrl shape) |
+| **POISON** | orphaned procs mid-run: booking survives, the sweep cleans up |
+| **DEADLOCK** | the memory balancer against the completion drain: deadlocks held at zero |
+| **FOLDER** | a folder core ceiling holds the folder at its cap |
+| **PARITY_OLD / PARITY_NEW** | the standard job shapes book under contention on the legacy and new paths alike |
+| **LOCALITY** | refills return to hosts already running the layer, with and without the bonus |
+| **DEPENDS** | no frame ever runs with unsatisfied depends; depends do satisfy |
+| **FAILOVER** | the leader dies mid-run; the standby books and accepts submissions |
+| **TAGS_GPU** | tags and a GPU slice fragment the farm: zero placement violations |
+| **TAGMAX** | 120 tags shatter the farm: no layer is planned in many groups only to lose the race |
+
+The same list prints from `python simulate.py --help`.
 
 **Run it exactly as `python simulate.py --verify` — do not add or change flags.**
 Each scenario is tuned (farm size, oversubscription, frame length) so its verdict
