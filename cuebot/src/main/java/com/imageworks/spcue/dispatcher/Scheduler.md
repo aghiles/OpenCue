@@ -539,6 +539,53 @@ work. The pre-feature disease (every frame at 1 core, ~10% core utilisation
 on a memory-full farm) was demonstrated fail-first against the unmodified
 scheduler.
 
+### 3.10 Automatic core reduction (the squeeze)
+
+A render layer asks for a fixed number of cores and a fixed amount of
+memory for each frame. On a busy host the free remainder is often
+slightly smaller than that request. A 32-core host running one
+16-core/56G frame keeps 16 cores free but not enough memory for a
+second. A 16-core host with 53G usable can never serve a 56G request.
+Those cores exist, but no waiting frame can buy them, so they sit idle.
+
+The scheduler recovers that capacity by booking a frame at reduced
+cores. Placement prices the choice instead of special-casing it. Each
+host contributes ONE candidate to the layer's score list: its full-fit
+score when the whole request fits, otherwise the score of the largest
+reduced shape that does fit, divided by the fraction of the work that
+shape delivers. A booking at 80% of the cores does about 80% of the
+work, so its cost is divided by 0.8. Because the memory reservation
+does not shrink with the cores, a full fit is always cheaper per unit
+of work wherever one exists, and the reduction only wins when nothing
+else can serve the layer. No mode switch and no threshold: the farm
+slides into reduced bookings as it fills, and out of them as it drains,
+by arithmetic alone.
+
+The reduced count keeps at least `SQUEEZE_MIN_FRAC` (0.8) of the
+request, a constant in the code rather than a setting. Only threadable
+layers qualify, since a single-threaded frame cannot use fewer cores.
+The memory reservation does NOT follow the cores down: it is the memory
+the layer is observed to really use, its live rss, or the declared
+request pro-rated to the reduced cores when that is higher. A layer
+that holds a whole scene in memory needs the same footprint at 13 cores
+as at 16, and a reservation below that truth would overrun a busy host
+and start kill cycles. The `SQUEEZE_FLAT` scenario proves that rule. A
+layer whose real memory use has never been observed cannot be reduced
+at all, whatever the scheduler otherwise believes about its shape. GPU
+requests never shrink and must fit as asked.
+
+A reduced booking is still one commit for that layer in that tick, the
+same rule every full booking obeys, so no layer can take host after
+host by shrinking. It passes every other gate unchanged: licenses,
+reservations, the per-host layer cap, and one plan per host and layer
+pair. The commit books exactly one frame and carries the exact reduced
+count to the dispatcher, which applies it as given. This is the only
+path where a booking goes below the layer's request.
+
+A frame with fewer cores runs proportionally longer, so the feature has
+to win on net throughput rather than on utilisation. The `SQUEEZE`
+scenario models that slowdown in the fake RQD and demands the net win.
+
 ## 4. Concurrency model
 
 The planner reasons over an in-memory snapshot while commits and external

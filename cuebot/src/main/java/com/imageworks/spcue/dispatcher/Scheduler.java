@@ -246,6 +246,8 @@ public class Scheduler extends JdbcDaoSupport {
     // deliver exactly what the scoring accounted.
     private final Map<String, Integer> plannedFramesByLayer = new HashMap<>();
     private final Map<String, int[]> planSliceByHostLayer = new HashMap<>();
+    // Written by submitCommit(); consumed by planBookings().
+    private final Map<String, long[]> planShapeByHostLayer = new HashMap<>();
     // Layers resized from rss evidence this tick: layerId -> {effective core points,
     // effective memory KB}, read by planBookings so the commit books the same shape the
     // planner scored.
@@ -308,6 +310,9 @@ public class Scheduler extends JdbcDaoSupport {
     // Core points per whole core: OpenCue stores host/proc cores as cores * 100.
     private static final int CORE_POINTS_PER_CORE = 100;
 
+    // The squeeze's core floor; see squeezeFitCp().
+    private static final double SQUEEZE_MIN_FRAC = 0.8;
+
     // Stat-line interval (scheduler.stat_interval_seconds, default 5 min).
     private volatile long statIntervalMs = 300_000;
     private long lastSummaryMs = 0;
@@ -321,6 +326,7 @@ public class Scheduler extends JdbcDaoSupport {
     private long summaryMaxTickMs = 0; // slowest single tick in the window
     private int summaryLockLost = 0; // attempts another Cuebot held the lock
     private long summaryPlanned = 0; // frames the plan phase produced
+    private long summarySqueezed = 0; // consumed by maybeLogStat()
     private int summaryGranted = 0; // new reservations granted
     private int summaryBackfilled = 0; // frames placed onto a reserved host
     private long summaryBackfilledCores = 0; // core-points placed via EASY backfill
@@ -346,6 +352,7 @@ public class Scheduler extends JdbcDaoSupport {
     private long winWaitTotalMax = 0;
     // Per-tick outputs set by doTick(), folded into the window by runTick().
     private long tickPlanned = 0;
+    private long tickSqueezed = 0;
     private int tickGranted = 0;
     private int tickBackfilled = 0;
     private long tickBackfilledCores = 0;
@@ -705,6 +712,7 @@ public class Scheduler extends JdbcDaoSupport {
                 if (ms > summaryMaxTickMs)
                     summaryMaxTickMs = ms;
                 summaryPlanned += tickPlanned;
+                summarySqueezed += tickSqueezed;
                 summaryGranted += tickGranted;
                 summaryBackfilled += tickBackfilled;
                 summaryBackfilledCores += tickBackfilledCores;
@@ -812,8 +820,9 @@ public class Scheduler extends JdbcDaoSupport {
      * (window seconds, ticks won, skipped when a tick fired while the previous still ran, lockLost
      * when this Cuebot was a standby, avgTick/maxTick); farm (the last planned tick's host/core
      * fill and host-spec group count, where a count near the host count is the tag-leak the
-     * guardrail warns on); flow (committed procs, frames planned, the gap lost to the frame-version
-     * race, RQD launches dropped); resv (reservations held and the cores they hold, newly granted,
+     * guardrail warns on); flow (committed procs, frames planned, frames squeezed below their ask
+     * at reduced cores, the gap lost to the frame-version race, RQD launches dropped); resv
+     * (reservations held and the cores they hold, newly granted,
      * requested last tick, and frames EASY-backfilled onto reserved hosts); and lic, only when
      * licenses are in play (frames booked against a pool, candidates a pool held back, and planned
      * frames trimmed at commit because a pool could not cover them).
@@ -872,11 +881,12 @@ public class Scheduler extends JdbcDaoSupport {
         logger.info(String.format(
                 "Scheduler stat: win=%ds ticks=%d skipped=%d lockLost=%d avgTick=%dms maxTick=%dms"
                         + " | farm hosts=%d idleHosts=%d cores=%d idleCores=%d util=%.1f%% groups=%d"
-                        + " | flow committed=%d planned=%d raceLost=%d launchDropped=%d drained=%d"
+                        + " | flow committed=%d planned=%d squeezed=%d raceLost=%d launchDropped=%d drained=%d"
                         + " | resv held=%d reservedCores=%d granted=%d reqs=%d backfilled=%d backfilledCores=%d%s%s",
                 win, summaryTicks, skipped, summaryLockLost, avgTick, summaryMaxTickMs, lastHosts,
                 lastIdleHosts, coresTotal, idleCores, util, lastGroups, summaryDispatched,
-                summaryPlanned, raceLost, droppedInWindow, summaryDrained, reservations.size(),
+                summaryPlanned, summarySqueezed, raceLost, droppedInWindow, summaryDrained,
+                reservations.size(),
                 reservedCp / CORE_POINTS_PER_CORE, summaryGranted, lastReservationReqs,
                 summaryBackfilled, summaryBackfilledCores / CORE_POINTS_PER_CORE, lic, waitlist));
 
@@ -887,6 +897,7 @@ public class Scheduler extends JdbcDaoSupport {
         summaryMaxTickMs = 0;
         summaryLockLost = 0;
         summaryPlanned = 0;
+        summarySqueezed = 0;
         summaryGranted = 0;
         summaryBackfilled = 0;
         summaryBackfilledCores = 0;
@@ -905,6 +916,7 @@ public class Scheduler extends JdbcDaoSupport {
      */
     private void resetTickOutputs() {
         tickPlanned = 0;
+        tickSqueezed = 0;
         tickGranted = 0;
         tickBackfilled = 0;
         tickBackfilledCores = 0;
@@ -1402,8 +1414,12 @@ public class Scheduler extends JdbcDaoSupport {
                     // same shape. {cores, memKb}; absent = book the layer's own ask.
                     long[] rz = layerResize.get(layerId);
                     int[] slice = planSliceByHostLayer.get(hostId + "|" + layerId);
+                    // A squeezed slice books BELOW the layer's ask on purpose;
+                    // its exact shape overrides the resize figure.
+                    long[] shape = planShapeByHostLayer.get(hostId + "|" + layerId);
                     List<FrameBooking> got = dispatcher.planHost(host, layer,
-                            rz != null ? (int) rz[0] : 0, rz != null ? rz[1] : 0,
+                            shape != null ? (int) shape[0] : (rz != null ? (int) rz[0] : 0),
+                            shape != null ? shape[1] : (rz != null ? rz[1] : 0), shape != null,
                             slice != null ? slice[0] : 0, slice != null ? slice[1] : 0);
                     if (got.isEmpty()) {
                         int streak = planZeroStreak.merge(layerId, 1, Integer::sum);
@@ -1480,6 +1496,7 @@ public class Scheduler extends JdbcDaoSupport {
                 continue;
             }
             c.rssProven = true;
+            c.typRssKb = typKb;
             int eff = (int) Math.round(typKb / (double) memPerCoreKb) * 100;
             if (c.layerCoresMax > 0 && eff > c.layerCoresMax) {
                 eff = c.layerCoresMax;
@@ -1750,6 +1767,7 @@ public class Scheduler extends JdbcDaoSupport {
         layerResize.clear();
         plannedFramesByLayer.clear();
         planSliceByHostLayer.clear();
+        planShapeByHostLayer.clear();
         if (!localityEnabled && layerHostMaxFrac <= 0)
             return affinity;
         getJdbcTemplate().query("SELECT pk_host, pk_layer, COUNT(*) AS n FROM proc "
@@ -2157,6 +2175,8 @@ public class Scheduler extends JdbcDaoSupport {
                 tickLicenseHeld++;
 
             boolean placed = false;
+            // Set after the layer's one normal commit; see the loop tail.
+            boolean squeezeOnlyPass = false;
             while (!capped) {
                 // Probe gate: a 1-core threadable layer with no rss evidence ("let the
                 // system decide") may hold only PROBE_FRAMES frames farm-wide, so a
@@ -2171,10 +2191,22 @@ public class Scheduler extends JdbcDaoSupport {
                 }
                 BookableHost best = null;
                 BookableHost cappedFallback = null;
+                int bestSqCp = 0;
                 double bestScore = Double.POSITIVE_INFINITY;
                 for (BookableHost h : hosts) {
-                    if (!fitsOnHost(c, h))
+                    int sqCp = 0;
+                    if (!fitsOnHost(c, h)) {
+                        // The host almost fits the request. A booking at reduced
+                        // cores competes in the same score list as the full fits;
+                        // the shape rules live on squeezeFitCp().
+                        if (!c.threadable || c.typRssKb <= 0)
+                            continue;
+                        sqCp = squeezeFitCp(c, h);
+                        if (sqCp <= 0)
+                            continue;
+                    } else if (squeezeOnlyPass) {
                         continue;
+                    }
                     // Same gate for a host-based license pool, but keyed by host
                     // name (what a license server reports) and against the live
                     // seat count rather than a typed-in cap: this host is
@@ -2204,11 +2236,18 @@ public class Scheduler extends JdbcDaoSupport {
                     // the fallback (the probe gate is their brake).
                     if (layerHostMaxFrac > 0 && hostLayerFrames
                             .getOrDefault(h.hostId + "|" + c.layerId, 0) >= layerHostCap(h, c)) {
-                        if (cappedFallback == null && c.rssProven)
+                        if (sqCp == 0 && cappedFallback == null && c.rssProven)
                             cappedFallback = h;
                         continue;
                     }
-                    double score = placementScore(h, c);
+                    // A booking at reduced cores delivers sqCp/coresMin of the
+                    // work, so its cost divides by that fraction. The memory
+                    // reservation does not shrink with the cores, so a full fit
+                    // is always cheaper per unit of work wherever one exists.
+                    double score = sqCp > 0
+                            ? placementScoreAt(h, c, sqCp, squeezeMemKb(c, sqCp))
+                                    * (c.layerCoresMin / (double) sqCp)
+                            : placementScore(h, c);
                     // Locality bonus: prefer a host already running this layer so
                     // a freed core is refilled by the same layer (same-machine
                     // locality, formerly the reactive DispatchNextFrame path).
@@ -2247,6 +2286,7 @@ public class Scheduler extends JdbcDaoSupport {
                     if (score < bestScore) {
                         bestScore = score;
                         best = h;
+                        bestSqCp = sqCp;
                     }
                 }
                 boolean overCap = false;
@@ -2256,14 +2296,29 @@ public class Scheduler extends JdbcDaoSupport {
                     best = cappedFallback;
                     overCap = true;
                 }
+                int effCoresCp = c.layerCoresMin;
+                long effMemKb = c.layerMemMin;
+                boolean squeezed = false;
+                if (best != null && bestSqCp > 0) {
+                    // The score chose a booking at reduced cores over every full
+                    // fit still open to this layer.
+                    effCoresCp = bestSqCp;
+                    effMemKb = squeezeMemKb(c, bestSqCp);
+                    squeezed = true;
+                    tickSqueezed++;
+                    if (logger.isDebugEnabled())
+                        logger.debug("Scheduler squeeze: layer " + c.layerId + " books "
+                                + best.hostName + " at " + effCoresCp + "cp/" + effMemKb
+                                + "kb of requested " + c.layerCoresMin + "cp/" + c.layerMemMin
+                                + "kb");
+                }
                 if (best == null)
                     break; // no host can fit this layer
 
-                // Estimate how many frames this commit will book. The
-                // dispatcher books up to job_frame_dispatch_max per call,
-                // bounded by the same fit checks placementScore uses.
-                int estFrames = headroomFrames(c, best, overCap, probeHeadroom, limitUsed,
-                        licenseUsable, folderUsed);
+                int estFrames = squeezed
+                        ? squeezedEstFrames(c, effCoresCp, limitUsed, licenseUsable, folderUsed)
+                        : headroomFrames(c, best, overCap, probeHeadroom, limitUsed,
+                                licenseUsable, folderUsed);
                 if (estFrames <= 0)
                     break;
 
@@ -2272,8 +2327,8 @@ public class Scheduler extends JdbcDaoSupport {
                 lastTickStats.bookedFramesByLocality.merge(localityKind(best, c), (long) estFrames,
                         Long::sum);
 
-                int estCores = estFrames * c.layerCoresMin;
-                long estMem = (long) estFrames * c.layerMemMin;
+                int estCores = estFrames * effCoresCp;
+                long estMem = (long) estFrames * effMemKb;
                 int estGpus = estFrames * c.layerGpusMin;
                 long estGpuMem = (long) estFrames * c.layerGpuMemMin;
 
@@ -2332,7 +2387,8 @@ public class Scheduler extends JdbcDaoSupport {
                 // No seize-on-dispatch: reservations are firm (see reservationAllows), so a host
                 // reached here is either its owner booking after the drain or an EASY-backfill
                 // borrow. A borrow never takes ownership, so the reservation is left intact.
-                submitCommit(best.hostId, c.layerId, estFrames);
+                submitCommit(best.hostId, c.layerId, estFrames, squeezed ? effCoresCp : 0,
+                        squeezed ? effMemKb : 0);
                 dispatched += estFrames;
                 placed = true;
 
@@ -2341,8 +2397,16 @@ public class Scheduler extends JdbcDaoSupport {
                 // A layer spreads across hosts over a few ticks instead. Soft-
                 // cap grants keep booking the remaining idle machines: their
                 // plans carry frame-slice offsets, so the reads stay disjoint.
-                if (!overCap)
+                if (overCap)
+                    continue;
+                // A booking at reduced cores that WON the score is this layer's
+                // one commit for the tick, exactly like a full one: arm the
+                // terminator so no layer can take host after host in one tick.
+                if (squeezed && squeezeOnlyPass)
+                    continue;
+                if (squeezeOnlyPass)
                     break;
+                squeezeOnlyPass = true;
             }
 
             // Why-not trace: one DEBUG line per candidate that wanted work but
@@ -2697,6 +2761,22 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /**
+     * Placement score for a booking at reduced cores: the same E-PVM marginal cost, taken at the
+     * reduced core count and the memory that booking reserves.
+     */
+    static double placementScoreAt(BookableHost h, LayerCandidate c, int coresCp, long memKb) {
+        return W_CORES * deltaCost(h.coresTotal, h.coresIdle, coresCp)
+                + W_MEM * deltaCost(h.memTotal, h.memIdle, memKb)
+                + W_GPUS * deltaCost(h.gpusTotal, h.gpusIdle, c.layerGpusMin)
+                + W_GPU_MEM * deltaCost(h.gpuMemTotal, h.gpuMemIdle, c.layerGpuMemMin);
+    }
+
+    // Consumed by dispatchGroupWithScoring(); same memory rule as squeezeFitCp().
+    static long squeezeMemKb(LayerCandidate c, int cp) {
+        return Math.max(c.typRssKb, c.layerMemMin * (long) cp / c.layerCoresMin);
+    }
+
+    /**
      * Marginal rise of one resource dimension's convex cost term when a reservation of {@code add}
      * is placed on a host that has {@code idle} free out of {@code total}. Returns 0 when the layer
      * does not use the dimension (add &lt;= 0) or the host has no capacity there.
@@ -2727,6 +2807,24 @@ public class Scheduler extends JdbcDaoSupport {
      * each term named. Zero or less means stop booking this candidate this tick. A soft-cap grant
      * (overCap) skips the per-host layer-cap term; the cap already yielded for this booking.
      */
+    /**
+     * Frames a reduced-cores commit may book: one, by construction. The host's free remainder is
+     * smaller than the request and the reduced count is at least SQUEEZE_MIN_FRAC of it, so
+     * exactly one such frame fits; a
+     * tick-wide cap (limit, license, folder) with no room for even that one zeroes it.
+     */
+    private int squeezedEstFrames(LayerCandidate c, int effCoresCp, Map<String, Integer> limitUsed,
+            int licenseUsable, Map<String, Integer> folderUsed) {
+        int est = Math.min(1, c.waitingFrameCount);
+        if (c.limitId != null && c.limitMax - limitUsed.get(c.limitId) < 1)
+            est = 0;
+        if (licenseUsable != Integer.MAX_VALUE && licenseUsable < 1)
+            est = 0;
+        if (c.folderMax >= 0 && c.folderMax - folderUsed.get(c.folderId) < effCoresCp)
+            est = 0;
+        return est;
+    }
+
     private int headroomFrames(LayerCandidate c, BookableHost best, boolean overCap,
             int probeHeadroom, Map<String, Integer> limitUsed, int licenseUsable,
             Map<String, Integer> folderUsed) {
@@ -2828,6 +2926,34 @@ public class Scheduler extends JdbcDaoSupport {
         return strandedCp / CORE_POINTS_PER_CORE;
     }
 
+    /**
+     * Largest whole-core reduction of the layer's request that fits this host's free remainder,
+     * in core points; 0
+     * when none does. A squeeze keeps at least SQUEEZE_MIN_FRAC of the asked cores and scales the
+     * memory ask by the same fraction, since threads and their working sets usually shrink
+     * together; the memory never drops below the ledger's typical footprint (typRssKb), because a
+     * footprint that does not follow the thread count would overrun the reservation and start
+     * host-OOM kill cycles. Callers therefore gate on typRssKb > 0: rssProven alone is not
+     * enough, since a multi-core ask with no samples is proven by exemption and gives the floor
+     * nothing to stand on. Gpu dimensions never scale and must fit as asked. Only shapes strictly
+     * under the ask count; a full fit is not a squeeze. One-core asks have nothing to shave.
+     */
+    static int squeezeFitCp(LayerCandidate c, BookableHost h) {
+        if (c.layerCoresMin < 2 * CORE_POINTS_PER_CORE)
+            return 0;
+        if (c.layerGpusMin > h.gpusIdle || c.layerGpuMemMin > h.gpuMemIdle)
+            return 0;
+        int floorCp = (int) Math.ceil(c.layerCoresMin * SQUEEZE_MIN_FRAC);
+        int maxCp = Math.min(h.coresIdle, c.layerCoresMin - 1);
+        for (int cp = maxCp / CORE_POINTS_PER_CORE * CORE_POINTS_PER_CORE; cp >= floorCp;
+                cp -= CORE_POINTS_PER_CORE) {
+            long memq = Math.max(c.typRssKb, c.layerMemMin * cp / c.layerCoresMin);
+            if (memq <= h.memIdle)
+                return cp;
+        }
+        return 0;
+    }
+
     private String localityKind(BookableHost h, LayerCandidate c) {
         Set<String> layersHere = hostLayerAffinity.get(h.hostId);
         if (layersHere != null && layersHere.contains(c.layerId))
@@ -2847,9 +2973,13 @@ public class Scheduler extends JdbcDaoSupport {
 
     /**
      * Record a (host, layer) placement to commit at the end of this tick. Planner-thread only;
-     * doTick drains plannedByHost via planHost + startFramesAndProcsBatch.
+     * doTick drains plannedByHost via planHost + startFramesAndProcsBatch. A squeezed placement
+     * passes its exact below-ask shape as (sqCoresCp, sqMemKb); 0 means the layer's own shape.
      */
-    private void submitCommit(String hostId, String layerId, int estFrames) {
+    private void submitCommit(String hostId, String layerId, int estFrames, int sqCoresCp,
+            long sqMemKb) {
+        if (sqCoresCp > 0)
+            planShapeByHostLayer.put(hostId + "|" + layerId, new long[] {sqCoresCp, sqMemKb});
         plannedByHost.computeIfAbsent(hostId, k -> new ArrayList<>()).add(layerId);
         placedLayerIds.add(layerId);
         // Slice bookkeeping: this plan starts where the layer's earlier plans
@@ -3176,6 +3306,8 @@ public class Scheduler extends JdbcDaoSupport {
         // True when rss sizing does not gate this layer: not threadable, feature off,
         // or the ledger has evidence (and the layer was resized from it).
         boolean rssProven;
+        // Stashed by resizeFromLiveMem(); consumed by squeezeFitCp().
+        long typRssKb;
         // Mutable in-tick accounting.
         int jobCoresInUse;
         int jobMaxCores;

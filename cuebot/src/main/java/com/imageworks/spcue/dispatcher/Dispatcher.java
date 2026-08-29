@@ -178,7 +178,7 @@ public interface Dispatcher {
      * @return the planned bookings, in placement order.
      */
     List<FrameBooking> planHost(DispatchHost host, LayerInterface layer, int effCores,
-            long effMemKb, int planOffset, int planLimit);
+            long effMemKb, boolean exactShape, int planOffset, int planLimit);
 
     /**
      * Dispatch a host to the specified job.

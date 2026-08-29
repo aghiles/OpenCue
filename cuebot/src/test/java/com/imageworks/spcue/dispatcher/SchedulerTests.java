@@ -287,6 +287,62 @@ public class SchedulerTests {
                 Arrays.asList(layer(CORE, 4 * GB, 0, 0))));
     }
 
+    // ---- squeezeFitCp -----------------------------------------------------
+
+    @Test
+    public void squeezeFindsTheLargestCountTheHostFits() {
+        // A 16-core/64G request against a host with 16 cores but 52G free.
+        // 13 cores pro-rate the memory to exactly 52G; 14 would need 56G. A
+        // roomier host gives the largest count below the request.
+        Scheduler.LayerCandidate c = layer(16 * CORE, 64 * GB, 0, 0);
+        assertEquals(13 * CORE,
+                Scheduler.squeezeFitCp(c, loadedHost(32 * CORE, 116 * GB, 16 * CORE, 52 * GB)));
+        assertEquals(15 * CORE,
+                Scheduler.squeezeFitCp(c, loadedHost(32 * CORE, 116 * GB, 15 * CORE, 100 * GB)));
+    }
+
+    @Test
+    public void squeezeRefusesBelowTheFloor() {
+        Scheduler.LayerCandidate c = layer(16 * CORE, 64 * GB, 0, 0);
+        // Memory: 48G only supports 12 cores' worth, 75% of the request.
+        assertEquals(0,
+                Scheduler.squeezeFitCp(c, loadedHost(128 * CORE, 496 * GB, 16 * CORE, 48 * GB)));
+        // Core floor: 12 idle cores are under 80% of 16.
+        assertEquals(0,
+                Scheduler.squeezeFitCp(c, loadedHost(32 * CORE, 116 * GB, 12 * CORE, 116 * GB)));
+    }
+
+    @Test
+    public void squeezeFloorsMemoryAtTheEvidence() {
+        // A flat-footprint layer, observed to hold 50G at any core count. The
+        // pro-rated figure (46.4G at 13 cores) would fit a 48G host and then
+        // overrun it at run time, so the observed use refuses the booking.
+        Scheduler.LayerCandidate flat = layer(14 * CORE, 50 * GB, 0, 0);
+        flat.typRssKb = 50 * GB;
+        assertEquals(0, Scheduler.squeezeFitCp(flat,
+                loadedHost(16 * CORE, 56 * GB, 15 * CORE, 48 * GB)));
+        // A host short on cores but holding the full footprint still books.
+        assertEquals(13 * CORE, Scheduler.squeezeFitCp(flat,
+                loadedHost(16 * CORE, 56 * GB, 13 * CORE, 53 * GB)));
+        // An over-declared layer (56G requested, 52G real): the 15-core
+        // pro-rated figure is 52.5G, above the observed use, and it books.
+        Scheduler.LayerCandidate over = layer(16 * CORE, 56 * GB, 0, 0);
+        over.typRssKb = 52 * GB;
+        assertEquals(15 * CORE, Scheduler.squeezeFitCp(over,
+                loadedHost(16 * CORE, 56 * GB, 15 * CORE, 55 * GB)));
+    }
+
+    @Test
+    public void squeezeSkipsOneCoreRequestsAndGpu() {
+        // A 1-core request has nothing to reduce.
+        assertEquals(0,
+                Scheduler.squeezeFitCp(layer(CORE, 4 * GB, 0, 0), freeHost(CORE, GB, 0, 0)));
+        // GPU never shrinks: no GPU on the host, no reduced booking.
+        Scheduler.LayerCandidate g = layer(16 * CORE, 64 * GB, 1, GB);
+        assertEquals(0,
+                Scheduler.squeezeFitCp(g, loadedHost(32 * CORE, 116 * GB, 15 * CORE, 60 * GB)));
+    }
+
     // ---- computeMaxMore ---------------------------------------------------
 
     @Test

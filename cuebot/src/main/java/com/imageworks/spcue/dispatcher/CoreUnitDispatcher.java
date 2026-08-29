@@ -436,9 +436,28 @@ public class CoreUnitDispatcher implements Dispatcher {
         throw new RuntimeException("not implemented)");
     }
 
+    /**
+     * A query-parameter copy of the host whose idle dimensions cover any ask. Serves the squeezed
+     * pull only: the frame query binds idle cores/memory/gpus against the layer's FULL ask, which
+     * a reduced-cores booking fails by design. The copy carries only the fields the pull binds; the real
+     * host object keeps doing the booking and the accounting.
+     */
+    private static DispatchHost queryCopyWithOpenIdle(DispatchHost host) {
+        DispatchHost copy = new DispatchHost();
+        copy.id = host.id;
+        copy.name = host.getName();
+        copy.threadMode = host.threadMode;
+        copy.isLocalDispatch = host.isLocalDispatch;
+        copy.idleCores = Integer.MAX_VALUE;
+        copy.idleMemory = Long.MAX_VALUE;
+        copy.idleGpus = Integer.MAX_VALUE;
+        copy.idleGpuMemory = Long.MAX_VALUE;
+        return copy;
+    }
+
     @Override
     public List<FrameBooking> planHost(DispatchHost host, LayerInterface layer, int effCores,
-            long effMemKb, int planOffset, int planLimit) {
+            long effMemKb, boolean exactShape, int planOffset, int planLimit) {
         // The scheduler accounted planLimit frames for this (host, layer) slice;
         // deliver exactly that. 0 = no slice info: legacy per-call trickle.
         int bookMax = planLimit > 0 ? planLimit
@@ -451,7 +470,9 @@ public class CoreUnitDispatcher implements Dispatcher {
         // Scheduler commits the bookings in bulk. No writes, no RQD launch.
         List<FrameBooking> bookings = new ArrayList<FrameBooking>();
 
-        List<DispatchFrame> frames = dispatchSupport.findNextDispatchFrames(layer, host,
+        // Squeezed (exact-shape) pull: see queryCopyWithOpenIdle().
+        DispatchHost pullHost = exactShape ? queryCopyWithOpenIdle(host) : host;
+        List<DispatchFrame> frames = dispatchSupport.findNextDispatchFrames(layer, pullHost,
                 Math.max(getIntProperty("dispatcher.frame_query_max"), bookMax), planOffset);
 
         String[] selfishServices =
@@ -462,11 +483,20 @@ public class CoreUnitDispatcher implements Dispatcher {
             // book the frames at that size, and reserve the memory the layer
             // really uses, so the plan and the commit describe the same frame.
             // 0 = no resize (no evidence, not threadable, or feature off).
-            if (effCores > frame.minCores && frame.threadable) {
+            // exactShape marks a squeezed slice: the planner chose a shape
+            // BELOW the request (at least 80% of it) rather than leave the
+            // host's free remainder idle,
+            // so the figure applies as given, never only upward.
+            if (exactShape && effCores > 0 && frame.threadable) {
                 frame.minCores = effCores;
-            }
-            if (effMemKb > frame.getMinMemory()) {
                 frame.setMinMemory(effMemKb);
+            } else {
+                if (effCores > frame.minCores && frame.threadable) {
+                    frame.minCores = effCores;
+                }
+                if (effMemKb > frame.getMinMemory()) {
+                    frame.setMinMemory(effMemKb);
+                }
             }
 
             VirtualProc proc;
