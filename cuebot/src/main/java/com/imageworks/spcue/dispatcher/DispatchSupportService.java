@@ -15,7 +15,10 @@
 
 package com.imageworks.spcue.dispatcher;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -37,6 +40,8 @@ import com.imageworks.spcue.StrandedCores;
 import com.imageworks.spcue.VirtualProc;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.dao.DataAccessException;
 import org.springframework.transaction.annotation.Propagation;
@@ -60,6 +65,7 @@ import com.imageworks.spcue.grpc.monitoring.ProcEvent;
 import com.imageworks.spcue.grpc.rqd.RunFrame;
 import com.imageworks.spcue.monitoring.KafkaEventPublisher;
 import com.imageworks.spcue.monitoring.MonitoringEventBuilder;
+import com.imageworks.spcue.dispatcher.commands.DispatchRqdKillFrame;
 import com.imageworks.spcue.rqd.RqdClient;
 import com.imageworks.spcue.service.BookingManager;
 import com.imageworks.spcue.service.DependManager;
@@ -79,11 +85,17 @@ public class DispatchSupportService implements DispatchSupport {
     private DependManager dependManager;
     private SubscriptionDao subscriptionDao;
     private RqdClient rqdClient;
+
+    // Shared async kill executor (same bean HostReportHandler uses); may be null in tests.
+    private HostReportQueue killQueue;
     private RedirectManager redirectManager;
     private BookingManager bookingManager;
     private BookingDao bookingDao;
     private KafkaEventPublisher kafkaEventPublisher;
     private MonitoringEventBuilder monitoringEventBuilder;
+
+    @Autowired
+    private Environment env;
 
     private ConcurrentHashMap<String, StrandedCores> strandedCores =
             new ConcurrentHashMap<String, StrandedCores>();
@@ -136,6 +148,13 @@ public class DispatchSupportService implements DispatchSupport {
     public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host,
             int limit) {
         return dispatcherDao.findNextDispatchFrames(layer, host, limit);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host,
+            int limit, int offset) {
+        return dispatcherDao.findNextDispatchFrames(layer, host, limit, offset);
     }
 
     @Override
@@ -232,6 +251,225 @@ public class DispatchSupportService implements DispatchSupport {
 
         // Publish FRAME_STARTED event (WAITING -> RUNNING transition)
         publishFrameStartedEvent(frame, proc, previousState);
+    }
+
+    /**
+     * Apply a chunk of queued frame completions in ONE transaction: stop the frames (state+version
+     * guarded), delete the winners' procs with their live reserved values, refund host and
+     * accounting resources.
+     *
+     * Lock order is PROC rows, then HOSTS, then stat rows, and it is load-bearing. Procs before
+     * hosts because every single-proc writer (the OOM memory bump, whose proc-update trigger then
+     * locks the host row) acquires "proc, then host"; a hosts-first flush deadlocks against it,
+     * seen live as the bump holding its proc row and waiting on a host this flush had pre-locked
+     * while the flush's batched DELETE waited on that proc row. Hosts before stats is the same
+     * global order as the booking commit (reserveHostResourcesBatch, then the frame-start stat
+     * pre-locks); the opposite interleaving deadlocks against a concurrent booking tick.
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRED)
+    public boolean[] stopFramesBatch(List<QueuedFrameCompletion> completions) {
+        // 0. Pre-lock proc rows, then hosts, for ALL queued completions (a
+        // superset of the winners). See the lock-order contract above.
+        List<VirtualProc> allProcs = new ArrayList<VirtualProc>(completions.size());
+        for (QueuedFrameCompletion c : completions) {
+            allProcs.add(c.proc);
+        }
+        procDao.lockProcsForBatch(allProcs);
+        procDao.lockHostsForBatch(allProcs);
+
+        // 1. Stop every queued frame in one guarded batch (stat triggers fire
+        // here, on counter rows the DAO pre-locked in sorted order).
+        boolean[] won = frameDao.batchUpdateFramesStopped(completions);
+
+        // 2. Winners' max-RSS high-water marks, coalesced: layer_mem/job_mem
+        // keep only the max, so one update per distinct layer/job carrying the
+        // batch max is equivalent to the per-frame updates it replaces.
+        Map<String, QueuedFrameCompletion> layerMax = new TreeMap<String, QueuedFrameCompletion>();
+        Map<String, QueuedFrameCompletion> jobMax = new TreeMap<String, QueuedFrameCompletion>();
+        List<QueuedFrameCompletion> winners =
+                new ArrayList<QueuedFrameCompletion>(completions.size());
+        for (int i = 0; i < completions.size(); i++) {
+            if (!won[i]) {
+                continue;
+            }
+            QueuedFrameCompletion c = completions.get(i);
+            winners.add(c);
+            QueuedFrameCompletion l = layerMax.get(c.frame.getLayerId());
+            if (l == null || c.report.getFrame().getMaxRss() > l.report.getFrame().getMaxRss()) {
+                layerMax.put(c.frame.getLayerId(), c);
+            }
+            QueuedFrameCompletion j = jobMax.get(c.frame.getJobId());
+            if (j == null || c.report.getFrame().getMaxRss() > j.report.getFrame().getMaxRss()) {
+                jobMax.put(c.frame.getJobId(), c);
+            }
+        }
+        for (QueuedFrameCompletion c : layerMax.values()) {
+            layerDao.updateLayerMaxRSS(c.frame, c.report.getFrame().getMaxRss(), false);
+        }
+        for (QueuedFrameCompletion c : jobMax.values()) {
+            jobDao.updateMaxRSS(c.frame, c.report.getFrame().getMaxRss());
+        }
+
+        // 3. Release the winners' procs in this same transaction, so freed
+        // capacity is visible to the plan that runs right after this flush.
+        // proc.unbooked=true makes the later post-complete operations treat
+        // the proc as already released (their unbook is a no-op). Local
+        // dispatches keep the per-proc path (different credit tables).
+        List<VirtualProc> releasable = new ArrayList<VirtualProc>(winners.size());
+        List<DispatchFrame> localFrames = new ArrayList<DispatchFrame>();
+        for (QueuedFrameCompletion c : winners) {
+            if (c.proc.isLocalDispatch) {
+                localFrames.add(c.frame);
+            } else {
+                releasable.add(c.proc);
+            }
+        }
+        if (!releasable.isEmpty()) {
+            procDao.batchDeleteVirtualProcs(releasable);
+            for (VirtualProc proc : releasable) {
+                proc.unbooked = true;
+            }
+        }
+        if (!localFrames.isEmpty()) {
+            procDao.batchClearVirtualProcAssignments(localFrames);
+        }
+        return won;
+    }
+
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRED)
+    public int sweepOrphanedProcs(int olderThanSeconds) {
+        List<VirtualProc> orphans = procDao.deleteOrphanedProcs(olderThanSeconds);
+        if (!orphans.isEmpty()) {
+            // The delete refunded the host and credited the accounting tables.
+            // A swept corpse's render may still be alive; kill it before the
+            // frame is rebooked (the sweep runs before this tick plans).
+            StringBuilder sb = new StringBuilder();
+            for (VirtualProc p : orphans) {
+                sb.append(' ').append(p.frameId);
+                if (p.frameId != null && p.hostName != null) {
+                    killOrphanRender(p, "orphaned proc swept while its frame was not RUNNING");
+                }
+            }
+            logger.warn("janitor swept " + orphans.size() + " orphaned proc(s) whose frames are"
+                    + " no longer RUNNING (crash or failed completion left them); frames:" + sb);
+        }
+        return orphans.size();
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRED)
+    public List<FrameBooking> startFramesAndProcsBatch(List<FrameBooking> bookings) {
+        if (bookings == null || bookings.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+
+        // 1. CAPACITY GATE (before any frame is marked RUNNING): guarded
+        // per-host decrement; a host without room matches 0 rows and its
+        // bookings stay WAITING for next tick, so a host is never overcommitted
+        // (which would trip verify_host_resources and abort the whole batch).
+        List<VirtualProc> demanded = new ArrayList<VirtualProc>(bookings.size());
+        for (FrameBooking b : bookings) {
+            // Apply any per-frame OOM memory bump BEFORE the capacity gate, so the host
+            // reservation and the proc agree on the bumped amount (else the host would be
+            // under-reserved for RAM). Outlier frames climb here without touching the layer.
+            long bump = OomMemoryTracker.INSTANCE.frameBumpKb(b.frame.getFrameId());
+            if (bump > b.proc.memoryReserved) {
+                b.proc.memoryReserved = bump;
+            }
+            demanded.add(b.proc);
+        }
+        Set<String> affordableHosts = procDao.reserveHostResourcesBatch(demanded);
+
+        List<FrameBooking> affordable = new ArrayList<FrameBooking>(bookings.size());
+        for (FrameBooking b : bookings) {
+            if (affordableHosts.contains(b.proc.getHostId())) {
+                affordable.add(b);
+            }
+        }
+        if (affordable.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+
+        // 2. Version-guarded RUNNING transition for the affordable bookings. The
+        // returned mask tells us which frames we actually won.
+        boolean[] won = frameDao.batchUpdateFramesStarted(affordable);
+
+        List<FrameBooking> winners = new ArrayList<FrameBooking>(affordable.size());
+        List<VirtualProc> winnerProcs = new ArrayList<VirtualProc>(affordable.size());
+        List<VirtualProc> raceLosers = new ArrayList<VirtualProc>();
+        for (int i = 0; i < affordable.size(); i++) {
+            FrameBooking b = affordable.get(i);
+            if (won[i]) {
+                // Stamp the frame linkage onto the proc (the planning path
+                // never sets it); without this every proc lands with
+                // pk_frame=NULL, holding cores while backing no frame.
+                b.proc.frameId = b.frame.getFrameId();
+                b.proc.jobId = b.frame.getJobId();
+                b.proc.layerId = b.frame.getLayerId();
+                b.proc.showId = b.frame.getShowId();
+                winners.add(b);
+                winnerProcs.add(b.proc);
+            } else {
+                // Capacity was reserved in step 1 but the frame was lost to the
+                // version race (rare): give that host's reservation back so its
+                // idle count is not leaked.
+                raceLosers.add(b.proc);
+            }
+        }
+
+        // 3. Refund hosts for the rare race-losers (re-increment only -> never
+        // negative, never trips the trigger).
+        if (!raceLosers.isEmpty()) {
+            procDao.refundHostResourcesBatch(raceLosers);
+        }
+
+        if (winnerProcs.isEmpty()) {
+            return winners;
+        }
+
+        // 4. EVICT STALE PROCS on frames we just won: we hold the WAITING ->
+        // RUNNING transition, so any proc still sitting there is a corpse, and
+        // ONE corpse would wedge the planner forever (c_proc_uk collision
+        // rolls back the whole batch, every tick). Delete it, refund its host.
+        List<String> winnerFrameIds = new ArrayList<String>(winnerProcs.size());
+        for (FrameBooking b : winners) {
+            winnerFrameIds.add(b.frame.getFrameId());
+        }
+        List<VirtualProc> stale = procDao.deleteStaleProcsByFrames(winnerFrameIds);
+        if (!stale.isEmpty()) {
+            // The delete refunded the host and credited the accounting tables.
+            // A corpse from a stale release may still be rendering; kill it,
+            // EXCEPT on a host this batch is booking, where the kill
+            // (addressed host+frame) would hit the fresh run inserted below.
+            java.util.Set<String> bookingHosts = new java.util.HashSet<String>();
+            for (FrameBooking b : winners) {
+                bookingHosts.add(b.proc.getHostId());
+            }
+            StringBuilder sb = new StringBuilder();
+            for (VirtualProc p : stale) {
+                sb.append(' ').append(p.frameId);
+                if (p.frameId != null && p.hostName != null
+                        && !bookingHosts.contains(p.getHostId())) {
+                    killOrphanRender(p, "stale proc evicted while its frame was rebooked");
+                }
+            }
+            logger.warn("evicted " + stale.size() + " stale proc(s) blocking this tick's"
+                    + " bookings (crash or failed completion left them); frames:" + sb);
+        }
+
+        // 5. Insert the winner procs. Host idle was already decremented in step 1,
+        // so this only writes the proc rows. The subscription/layer/job/folder/
+        // point counters are batched by the Scheduler from the winners returned here.
+        procDao.batchInsertVirtualProcs(winnerProcs);
+
+        // 6. Publish FRAME_STARTED events (WAITING -> RUNNING).
+        for (FrameBooking b : winners) {
+            publishFrameStartedEvent(b.frame, b.proc, FrameState.WAITING);
+        }
+        return winners;
     }
 
     @Transactional(propagation = Propagation.REQUIRED, readOnly = true)
@@ -481,20 +719,23 @@ public class DispatchSupportService implements DispatchSupport {
     }
 
     @Transactional(propagation = Propagation.REQUIRED)
-    public void unbookProc(VirtualProc proc) {
-        unbookProc(proc, "was unbooked");
+    public boolean unbookProc(VirtualProc proc) {
+        return unbookProc(proc, "was unbooked");
     }
 
     @Transactional(propagation = Propagation.REQUIRED)
-    public void unbookProc(VirtualProc proc, String reason) {
+    public boolean unbookProc(VirtualProc proc, String reason) {
         if (proc == null) {
-            return;
+            return false;
         }
         if (proc.isNew()) {
-            return;
+            return false;
         }
         proc.unbooked = true;
-        procDao.deleteVirtualProc(proc);
+        // The proc row is the run-identity token: deleting it is how a caller
+        // proves the run was still theirs to release. A false return means
+        // someone else already released (and possibly rebooked) this run.
+        boolean deleted = procDao.deleteVirtualProc(proc);
         publishProcEvent(EventType.PROC_UNBOOKED, proc);
         DispatchSupport.unbookedProcs.getAndIncrement();
         logger.info(proc + " " + reason);
@@ -510,14 +751,85 @@ public class DispatchSupportService implements DispatchSupport {
                 // Eat the exception.
             }
         }
+        return deleted;
     }
 
     @Override
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    public void lostProc(VirtualProc proc, String reason, int exitStatus) {
-        long numCleared = clearedProcs.incrementAndGet();
+    public boolean lostProc(VirtualProc proc, String reason, int exitStatus) {
+        /*
+         * Kill the frame on RQD before releasing it back to a bookable state. Without this, a host
+         * that is merely flapping (transient unreachable/DOWN report, GC pause, dropped report)
+         * keeps rendering the frame while the dispatcher resets it to WAITING and re-books it
+         * elsewhere, silently double-booking the frame onto two hosts.
+         */
+        boolean killBeforeReleaseEnabled = env.getProperty(
+                "dispatcher.kill_running_frame_before_release_enabled", Boolean.class, true);
 
-        unbookProc(proc, "proc " + proc.getName() + " is #" + numCleared + " cleared: " + reason);
+        /*
+         * Whether the running frame is known to be stopped on RQD after this point.
+         * EXIT_STATUS_FAILED_KILL means the caller (JobManagerSupport.kill) already attempted this
+         * exact kill and it threw, so the frame is NOT known-stopped and we must not re-kill.
+         */
+        boolean frameKilled;
+        if (exitStatus == Dispatcher.EXIT_STATUS_FAILED_KILL) {
+            frameKilled = false;
+        } else if (proc.frameId != null && killBeforeReleaseEnabled) {
+            try {
+                rqdClient.killFrame(proc, "kill-before-release: " + reason);
+                frameKilled = true;
+            } catch (Exception e) {
+                logger.info("kill-before-release failed for " + proc.getName() + ", " + e);
+                frameKilled = false;
+            }
+        } else {
+            // Feature disabled or no frame to kill: preserve legacy release behavior.
+            frameKilled = true;
+        }
+
+        /*
+         * Flapping and genuinely-dead hosts are indistinguishable at kill time. If the kill could
+         * not confirm the frame is stopped and the host is not confirmed dead, releasing the frame
+         * now would re-book it onto a second host while this RQD keeps rendering. In that case we
+         * DEFER the release: the proc row and RUNNING frame are left intact (preserving the
+         * host<->frame link, which is otherwise lost once the proc is deleted) so the frame is
+         * reclaimed later, once the host is confirmed DOWN (clearDownProcs) or the frame completes
+         * naturally. A genuinely dead host (marked DOWN, or no longer Up) leaves no live RQD, so
+         * release is safe. See design/frame_double_booking_v2.md.
+         */
+        boolean deferReleaseEnabled = env.getProperty(
+                "dispatcher.defer_release_on_failed_kill_enabled", Boolean.class, true);
+        if (deferReleaseEnabled && !frameKilled && proc.frameId != null) {
+            boolean hostConfirmedDead =
+                    exitStatus == Dispatcher.EXIT_STATUS_DOWN_HOST || !hostDao.isHostUp(proc);
+            if (!hostConfirmedDead) {
+                DispatchSupport.deferredReleaseProcs.incrementAndGet();
+                logger.warn("Deferring release of lost proc " + proc.getName()
+                        + ": kill-before-release could not confirm the frame stopped and the host "
+                        + "is not confirmed dead. Leaving frame " + proc.frameId
+                        + " RUNNING to avoid double-booking. reason=" + reason);
+                return false;
+            }
+        }
+
+        // Count the clear only now that the proc is actually being released; deferrals above
+        // return early and must not inflate this counter.
+        long numCleared = clearedProcs.incrementAndGet();
+        boolean unbooked = unbookProc(proc,
+                "proc " + proc.getName() + " is #" + numCleared + " cleared: " + reason);
+
+        /*
+         * Ownership fence: a false return means someone else already released this run and the
+         * frame may have been rebooked. The stop below re-fetches the frame, so its version guard
+         * would pass against the CURRENT run; touch nothing. Crash-stranded frames are reclaimed
+         * by maintenance's orphaned-frame reset.
+         */
+        if (!unbooked) {
+            logger.warn("lostProc: proc " + proc.getName() + " for frame " + proc.frameId
+                    + " was already released by someone else; leaving the frame alone. reason="
+                    + reason);
+            return false;
+        }
 
         if (proc.frameId != null) {
             FrameInterface f = frameDao.getFrame(proc.frameId);
@@ -550,6 +862,7 @@ public class DispatchSupportService implements DispatchSupport {
         } else {
             logger.info("Frame ID is NULL, not updating Frame state");
         }
+        return true;
     }
 
     @Override
@@ -649,6 +962,32 @@ public class DispatchSupportService implements DispatchSupport {
 
     public void setRqdClient(RqdClient rqdClient) {
         this.rqdClient = rqdClient;
+    }
+
+    public HostReportQueue getKillQueue() {
+        return killQueue;
+    }
+
+    public void setKillQueue(HostReportQueue killQueue) {
+        this.killQueue = killQueue;
+    }
+
+    /**
+     * Best-effort kill for a corpse proc's possibly-still-alive render, enqueued on the shared
+     * kill queue. A crash corpse is dead and the kill is a cheap no-op; a stale-release corpse is
+     * alive, and this keeps it from double-rendering its rebooked frame.
+     */
+    private void killOrphanRender(VirtualProc proc, String reason) {
+        if (killQueue == null) {
+            return;
+        }
+        try {
+            killQueue.execute(new DispatchRqdKillFrame(proc.hostName, proc.frameId,
+                    "orphaned render cleanup: " + reason, rqdClient));
+        } catch (Exception e) {
+            logger.warn("could not enqueue orphan-render kill for frame " + proc.frameId + " on "
+                    + proc.hostName + ": " + e);
+        }
     }
 
     public SubscriptionDao getSubscriptionDao() {

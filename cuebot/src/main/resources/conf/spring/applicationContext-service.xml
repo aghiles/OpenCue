@@ -36,7 +36,7 @@
   <!-- Non-Transactional Service Domain -->
   <!-- ##################################################################################### -->
 
-  <bean id="rqdClient" class="com.imageworks.spcue.rqd.RqdClientGrpc">
+  <bean id="rqdClient" class="com.imageworks.spcue.rqd.RqdClientGrpc" destroy-method="shutdown">
     <constructor-arg index="0" type="int">
       <value>${grpc.rqd_server_port}</value>
     </constructor-arg>
@@ -66,7 +66,7 @@
     <property name="queueCapacity" value="500" />
   </bean>
 
-  <bean id="bookingQueue" class="com.imageworks.spcue.dispatcher.BookingQueue" lazy-init="true" destroy-method="shutdown" depends-on="cueDataSource">
+  <bean id="bookingQueue" class="com.imageworks.spcue.dispatcher.BookingQueue" lazy-init="true" destroy-method="shutdown" depends-on="cueDataSource,rqdClient">
     <constructor-arg index="0" type="int">
       <value>${booking_queue.threadpool.health_threshold}</value>
     </constructor-arg>
@@ -85,7 +85,7 @@
     <property name="shutdownDrainMs" value="${healthy_threadpool.shutdown_drain_ms:60000}"/>
   </bean>
 
-  <bean id="dispatchQueue" class="com.imageworks.spcue.dispatcher.DispatchQueue" destroy-method="shutdown" depends-on="cueDataSource">
+  <bean id="dispatchQueue" class="com.imageworks.spcue.dispatcher.DispatchQueue" destroy-method="shutdown" depends-on="cueDataSource,rqdClient">
     <constructor-arg index="0" type="java.lang.String">
       <value>DispatchQueue</value>
     </constructor-arg>
@@ -107,7 +107,7 @@
     <property name="shutdownDrainMs" value="${healthy_threadpool.shutdown_drain_ms:60000}"/>
   </bean>
 
-  <bean id="manageQueue" class="com.imageworks.spcue.dispatcher.DispatchQueue"   destroy-method="shutdown" depends-on="cueDataSource">
+  <bean id="manageQueue" class="com.imageworks.spcue.dispatcher.DispatchQueue"   destroy-method="shutdown" depends-on="cueDataSource,rqdClient">
     <constructor-arg index="0" type="java.lang.String">
       <value>ManageQueue</value>
     </constructor-arg>
@@ -128,7 +128,7 @@
     </constructor-arg>
     <property name="shutdownDrainMs" value="${healthy_threadpool.shutdown_drain_ms:60000}"/>
   </bean>
-  <bean id="reportQueue" class="com.imageworks.spcue.dispatcher.HostReportQueue" destroy-method="shutdown" depends-on="cueDataSource">
+  <bean id="reportQueue" class="com.imageworks.spcue.dispatcher.HostReportQueue" destroy-method="shutdown" depends-on="cueDataSource,rqdClient">
     <constructor-arg index="0" type="int">
       <value>${report_queue.threadPoolSizeInitial}</value>
     </constructor-arg>
@@ -140,7 +140,7 @@
     </constructor-arg>
     <property name="shutdownDrainMs" value="${host_report_queue.shutdown_drain_ms:60000}"/>
   </bean>
-  <bean id="killQueue" class="com.imageworks.spcue.dispatcher.HostReportQueue" destroy-method="shutdown" depends-on="cueDataSource">
+  <bean id="killQueue" class="com.imageworks.spcue.dispatcher.HostReportQueue" destroy-method="shutdown" depends-on="cueDataSource,rqdClient">
     <constructor-arg index="0" type="int">
       <value>${kill_queue.threadPoolSizeInitial}</value>
     </constructor-arg>
@@ -189,6 +189,7 @@
   </bean>
 
   <bean id="dispatchSupport" class="com.imageworks.spcue.dispatcher.DispatchSupportService">
+    <property name="killQueue" ref="killQueue" />
     <property name="dispatcherDao" ref="dispatcherDao" />
     <property name="jobDao" ref="jobDao" />
     <property name="frameDao" ref="frameDao" />
@@ -305,7 +306,10 @@
     <property name="manageQueue" ref="manageQueue" />
     <property name="dispatchQueue" ref="dispatchQueue" />
     <property name="reportQueue" ref="reportQueue" />
+    <property name="hostManager" ref="hostManager" />
   </bean>
+
+  <bean id="schedulerMetrics" class="com.imageworks.spcue.dispatcher.SchedulerMetrics" />
 
   <bean id="historicalManager" class="com.imageworks.spcue.service.HistoricalManagerService">
     <property name="historicalDao" ref="historicalDao" />
@@ -414,6 +418,23 @@
     <property name="monitoringEventBuilder" ref="monitoringEventBuilder" />
   </bean>
 
+  <!-- Single-thread Scheduler. Disabled by default (scheduler.enabled).
+       When enabled, HostReportHandler suppresses the legacy per-host
+       BookingQueue enqueue, and the Quartz trigger below drives a single
+       tick that groups hosts by static spec and runs one candidate-layer
+       query per group. Cross-Cuebot exclusion via pg_try_advisory_lock. -->
+  <bean id="scheduler" class="com.imageworks.spcue.dispatcher.Scheduler" depends-on="cueDataSource"
+        destroy-method="onShutdown">
+    <property name="dataSource"  ref="cueDataSource" />
+    <property name="dispatcher"  ref="dispatcher" />
+    <property name="dispatchSupport" ref="dispatchSupport" />
+    <property name="hostManager" ref="hostManager" />
+    <property name="jobManager"  ref="jobManager" />
+    <property name="rqdClient"   ref="rqdClient" />
+    <property name="frameCompleteHandler" ref="frameCompleteHandler" />
+    <property name="schedulerMetrics" ref="schedulerMetrics" />
+  </bean>
+
   <!-- ##################################################################################### -->
   <!-- Timers -->
   <!-- ##################################################################################### -->
@@ -515,6 +536,19 @@
     <property name="repeatInterval" value="60000"/>
     <!-- delay 30 seconds-->
     <property name="startDelay" value="30000" />
+  </bean>
+
+  <bean id="schedulerTickJob" class="org.springframework.scheduling.quartz.MethodInvokingJobDetailFactoryBean">
+    <property name="targetObject" ref="scheduler" />
+    <property name="targetMethod" value="runTick" />
+    <!-- Tick is a no-op when scheduler.enabled=false, so it is safe to
+         register the trigger unconditionally. -->
+    <property name="concurrent" value="false" />
+  </bean>
+
+  <bean id="schedulerTrigger" class="org.springframework.scheduling.quartz.SimpleTriggerFactoryBean">
+    <property name="jobDetail" ref="schedulerTickJob" />
+    <property name="repeatInterval" value="${scheduler.interval_ms:1000}" />
   </bean>
 
   <bean id="reportQueueSchedule" class="org.springframework.scheduling.quartz.SimpleTriggerFactoryBean">
@@ -641,6 +675,7 @@
         <ref bean="collectPrometheusMetricsTrigger" />
         <ref bean="subscriptionRecalculationTrigger" />
         <ref bean="stuckDependencyRecoveryTrigger" />
+        <ref bean="schedulerTrigger" />
       </list>
     </property>
   </bean>

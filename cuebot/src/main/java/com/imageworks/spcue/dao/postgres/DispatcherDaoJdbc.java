@@ -121,31 +121,11 @@ public class DispatcherDaoJdbc extends JdbcDaoSupport implements DispatcherDao {
      * Choose between different scheduling strategies
      */
     private SchedulingMode schedulingMode;
-    private Set<String> exclusionShowAllocs;
-    private Set<String> exclusionShows;
 
     @Autowired
     public DispatcherDaoJdbc(Environment env) {
         this.schedulingMode = SchedulingMode.valueOf(
                 env.getProperty("dispatcher.scheduling_mode", String.class, "PRIORITY_ONLY"));
-
-        // Parse the exclusion list from environment variable
-        // Expected format: "show1:allocation1,show2:allocation2"
-        String exclusionListStr = env.getProperty("dispatcher.exclusion_list", String.class, "");
-        this.exclusionShowAllocs = new LinkedHashSet<String>();
-        this.exclusionShows = new LinkedHashSet<String>();
-        if (!exclusionListStr.isEmpty()) {
-            for (String item : exclusionListStr.split(",")) {
-                String trimmedItem = item.trim();
-                if (!trimmedItem.isEmpty()) {
-                    if (trimmedItem.contains(":")) {
-                        this.exclusionShowAllocs.add(trimmedItem);
-                    } else {
-                        this.exclusionShows.add(trimmedItem);
-                    }
-                }
-            }
-        }
     }
 
     @Override
@@ -191,38 +171,14 @@ public class DispatcherDaoJdbc extends JdbcDaoSupport implements DispatcherDao {
     private Set<String> findDispatchJobs(DispatchHost host, int numJobs, boolean shuffleShows) {
         LinkedHashSet<String> result = new LinkedHashSet<String>();
         List<SortableShow> shows = new LinkedList<SortableShow>(getBookableShows(host));
-        // shows were sorted. If we want it in random sequence, we need to shuffle it.
+        // Shuffle shows to get them processed randomly
         if (shuffleShows) {
-            if (!shows.isEmpty())
-                shows.remove(0);
             Collections.shuffle(shows);
         }
 
         long loopTime = System.currentTimeMillis();
-        // Filter out shows/allocs that are being dispatched by the new scheduler
-        // A list of show_name:alloc_name is read from the env to define which jobs
-        // should not be dispatched by Cuebot's dispatcher
         for (SortableShow s : shows) {
             long lastTime = System.currentTimeMillis();
-            String showName = s.getShowName();
-
-            // Check if this show:allocation combination is in the exclusion list
-            if (!exclusionShows.isEmpty()) {
-                if (exclusionShows.contains(showName)) {
-                    logger.info("skipping show " + showName + " entirely due to exclusion list");
-                    continue;
-                }
-            }
-
-            // Check if this show is in the exclusion list
-            if (!exclusionShowAllocs.isEmpty()) {
-                String exclusionKey = showName + ":" + host.allocationName;
-                if (exclusionShowAllocs.contains(exclusionKey)) {
-                    logger.info("skipping show " + showName + " on allocation "
-                            + host.allocationName + " due to exclusion list");
-                    continue;
-                }
-            }
 
             if (s.isSkipped(host.tags, (long) host.cores, host.memory)) {
                 logger.info("skipping show " + s.getShowId());
@@ -481,15 +437,43 @@ public class DispatcherDaoJdbc extends JdbcDaoSupport implements DispatcherDao {
                     layer.getLayerId(), limit);
 
         } else {
+            // Bind order must match the query: outer layer.pk_layer=?, then
+            // the tag subquery's h.str_name=?, then its l.pk_layer=?. The host
+            // name and the second layer id were transposed, so the tag
+            // subquery matched no host/layer and the query returned no frames.
             frames = getJdbcTemplate().query(FIND_DISPATCH_FRAME_BY_LAYER_AND_HOST,
                     FrameDaoJdbc.DISPATCH_FRAME_MAPPER, host.idleCores, host.idleMemory,
                     threadMode(host.threadMode), host.idleGpus, host.idleGpuMemory,
-                    layer.getLayerId(), layer.getLayerId(), host.getName(), limit);
+                    layer.getLayerId(), host.getName(), layer.getLayerId(), limit);
         }
 
         prometheusMetrics.setBookingDurationMetric("findNextDispatchFrames by layer and host query",
                 System.currentTimeMillis() - lastTime);
 
+        return frames;
+    }
+
+    // The same layer query over a slice: rows (offset, offset+limit] of the
+    // dispatchable-frame ranking, so parallel same-layer plans on different
+    // hosts pull disjoint frames.
+    private static final String FIND_DISPATCH_FRAME_BY_LAYER_AND_HOST_SLICE =
+            FIND_DISPATCH_FRAME_BY_LAYER_AND_HOST.replace("WHERE LINENUM <= ?",
+                    "WHERE LINENUM > ? AND LINENUM <= ?");
+
+    @Override
+    public List<DispatchFrame> findNextDispatchFrames(LayerInterface layer, DispatchHost host,
+            int limit, int offset) {
+        if (offset <= 0 || host.isLocalDispatch) {
+            return findNextDispatchFrames(layer, host, limit);
+        }
+        long lastTime = System.currentTimeMillis();
+        List<DispatchFrame> frames = getJdbcTemplate().query(
+                FIND_DISPATCH_FRAME_BY_LAYER_AND_HOST_SLICE, FrameDaoJdbc.DISPATCH_FRAME_MAPPER,
+                host.idleCores, host.idleMemory, threadMode(host.threadMode), host.idleGpus,
+                host.idleGpuMemory, layer.getLayerId(), host.getName(), layer.getLayerId(), offset,
+                offset + limit);
+        prometheusMetrics.setBookingDurationMetric("findNextDispatchFrames by layer and host query",
+                System.currentTimeMillis() - lastTime);
         return frames;
     }
 
