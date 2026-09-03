@@ -61,6 +61,7 @@ import com.imageworks.spcue.VirtualProc;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.service.HostManager;
 import com.imageworks.spcue.rqd.RqdClient;
+import com.imageworks.spcue.rqd.RqdLaunchUnknownOutcomeException;
 import com.imageworks.spcue.service.JobManager;
 
 /**
@@ -1431,6 +1432,11 @@ public class Scheduler extends JdbcDaoSupport {
                     .equals(planned.get(end - 1).proc.getHostId()))
                 end++;
             final List<FrameBooking> chunk = new ArrayList<>(planned.subList(start, end));
+            if (!leaderAlive()) {
+                logger.warn("Scheduler: leadership lost mid-commit, "
+                        + (planned.size() - start) + " planned frames left for the next leader");
+                break;
+            }
             List<FrameBooking> won = txTemplate().execute(status -> {
                 List<FrameBooking> w = dispatchSupport.startFramesAndProcsBatch(chunk);
                 applyResourceDeltas(w);
@@ -1506,16 +1512,22 @@ public class Scheduler extends JdbcDaoSupport {
         plannedByHost.clear();
 
         List<FrameBooking> planned = new ArrayList<>();
+        int failedTasks = 0;
+        String firstCause = null;
         try {
             for (Future<List<FrameBooking>> f : readPool.invokeAll(tasks)) {
                 try {
                     planned.addAll(f.get());
                 } catch (ExecutionException ee) {
-                    logger.debug("Scheduler: plan task failed: "
-                            + (ee.getCause() != null ? ee.getCause().getMessage()
-                                    : ee.getMessage()));
+                    failedTasks++;
+                    if (firstCause == null)
+                        firstCause = ee.getCause() != null ? ee.getCause().toString()
+                                : ee.toString();
                 }
             }
+            if (failedTasks > 0)
+                logger.warn("Scheduler: " + failedTasks + " of " + tasks.size()
+                        + " plan tasks failed this tick, first cause: " + firstCause);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return null;
@@ -1644,6 +1656,10 @@ public class Scheduler extends JdbcDaoSupport {
             launchPool.execute(() -> {
                 try {
                     dispatchSupport.runFrame(fb.proc, fb.frame);
+                } catch (RqdLaunchUnknownOutcomeException e) {
+                    // RQD may have started the frame: confirm before anything
+                    // is released, else the frame could run twice.
+                    dispatchSupport.resolveUnknownLaunchOutcome(fb.proc, fb.frame);
                 } catch (RuntimeException e) {
                     logger.warn("Scheduler: RQD launch failed for " + fb.proc.getName()
                             + " on frame " + fb.frame.getFrameId() + ": " + e.getMessage()
@@ -1653,7 +1669,7 @@ public class Scheduler extends JdbcDaoSupport {
                         dispatchSupport.clearFrame(fb.frame);
                         rqdClient.killFrame(fb.proc, "launch failed during scheduler dispatch");
                     } catch (RuntimeException ce) {
-                        logger.debug("Scheduler: launch-failure cleanup partial for "
+                        logger.warn("Scheduler: launch-failure cleanup partial for "
                                 + fb.frame.getFrameId() + ": " + ce.getMessage());
                     }
                 }
@@ -1731,9 +1747,27 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /** Release (if the connection is still alive) and close the leadership connection. */
+    /** Whether this cuebot still holds the planning lock: the lock connection is alive. */
+    private boolean leaderAlive() {
+        Connection held = leaderConn;
+        try {
+            return held != null && held.isValid(1);
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
     private void closeLeaderConn() {
         Connection held = leaderConn;
         leaderConn = null;
+        // The next leader plans from the database, not from this planner's
+        // memory: reservations, blocked debt, warmth and odometers go with
+        // the lock.
+        reservations.clear();
+        blockedDebtMs.clear();
+        lastSeenMs.clear();
+        warmthByHost.clear();
+        bookingsByHost.clear();
         if (held != null) {
             releaseLeaderLock(held);
             try {
