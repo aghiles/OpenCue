@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -39,7 +40,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -55,9 +55,13 @@ import org.springframework.jdbc.core.support.JdbcDaoSupport;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.imageworks.spcue.DispatchFrame;
 import com.imageworks.spcue.DispatchHost;
+import com.imageworks.spcue.LayerEntity;
 import com.imageworks.spcue.LayerInterface;
 import com.imageworks.spcue.VirtualProc;
+import com.imageworks.spcue.grpc.host.HardwareState;
+import com.imageworks.spcue.grpc.host.LockState;
 import com.imageworks.spcue.grpc.host.ThreadMode;
 import com.imageworks.spcue.service.HostManager;
 import com.imageworks.spcue.rqd.RqdClient;
@@ -108,7 +112,7 @@ public class Scheduler extends JdbcDaoSupport {
     // never below 8 frames so small hosts still anchor a cache-warm batch. 0 disables;
     // default 0.25. Bounds the blast radius and the phase-locked IO of a hundred identical
     // frames blanketing one machine, at the price of nibbling more hosts per flood.
-    private volatile double layerHostMaxFrac = 0.25;
+    volatile double layerHostMaxFrac = 0.25;
 
     // Rss-driven sizing (no configuration, works out of the box; see planner.md 3.9).
     // cores=1 on a threadable layer means "let the system decide": such a layer probes at
@@ -153,7 +157,7 @@ public class Scheduler extends JdbcDaoSupport {
         return t;
     }
 
-    // Plans one host's next bookable frames via planHost() (legacy per-host dispatch path).
+    // consumed by planBookings()
     private Dispatcher dispatcher;
 
     // Applies frame completions; drives the stage-0 drain (drainResolvedCompletions).
@@ -200,9 +204,10 @@ public class Scheduler extends JdbcDaoSupport {
     // Live host reservations, persistent across ticks: host id -> claiming (layer, priority).
     // Planner-thread only (single-writer); empty after failover. See planner.md for the model.
     private final Map<String, Reservation> reservations = new HashMap<>();
+    private final Map<String, Set<String>> hostsByLayer = new HashMap<>(); // consumed by reserve()
 
     // ---- plan / batch-commit / launch -------------------------------------
-    // Placement only records (host, layer) pairings; after it, planHost reads each pairing's frames
+    // Placement only records (host, layer) pairings; after it, planBookings reads each layer's frames
     // and one batched transaction commits them all, then RQD launches fire on a small pool.
 
     // Per-tick placements to commit, host id -> layer ids. Planner-thread only; cleared each tick.
@@ -211,16 +216,16 @@ public class Scheduler extends JdbcDaoSupport {
 
     // Tick-scoped planning scratch (planner-thread only, reset each tick by clearTickScratch). Held
     // as fields so the phase methods share them without threading a dozen parameters.
-    private final Map<String, Integer> jobCoresUsed = new HashMap<>();
-    private final Map<String, Integer> showCoresUsed = new HashMap<>();
-    private final Map<String, Integer> limitUsed = new HashMap<>();
-    private final Map<String, Integer> folderUsed = new HashMap<>();
+    private final Map<String, Cell> jobCells = new HashMap<>(); // consumed by bindCells()
+    private final Map<String, Cell> showCells = new HashMap<>(); // consumed by bindCells()
+    private final Map<String, Cell> limitCells = new HashMap<>(); // consumed by bindCells()
+    private final Map<String, Cell> folderCells = new HashMap<>(); // consumed by bindCells()
     private final Map<String, Integer> folderMaxCp = new HashMap<>();
     private final Map<String, Integer> folderRunSeed = new HashMap<>();
     private final Map<String, String> jobFolderCap = new HashMap<>();
     private final Map<String, List<String>> layerLicenses = new HashMap<>();
     private final Map<String, LicenseSource.LicenseBudget> licenseBudgets = new HashMap<>();
-    private final Map<String, Integer> licenseUsed = new HashMap<>();
+    private final Map<String, Cell> licenseCells = new HashMap<>(); // consumed by bindCells()
     private final Map<String, Set<String>> licenseSeats = new HashMap<>();
     private final Set<String> seenLayerIds = new HashSet<>();
     private final List<ReservationRequest> reservationReqs = new ArrayList<>();
@@ -248,8 +253,11 @@ public class Scheduler extends JdbcDaoSupport {
     // (host|layer) plan's {starting offset, size} slice of the layer's
     // waiting list, so the parallel plan reads pull disjoint frames and
     // deliver exactly what the scoring accounted.
-    private final Map<String, Integer> plannedFramesByLayer = new HashMap<>();
-    private double[][] reachNeeds; // consumed by placementScore() and strandFreeFrames()
+    final Map<String, Integer> plannedFramesByLayer = new HashMap<>();
+    double[][] reachNeeds; // consumed by placementScore() and strandFreeFrames()
+    private HostClasses classes; // consumed by placeOnce()
+    private final List<LayerCandidate> alive = new ArrayList<>(); // consumed by othersWant()
+    private final List<List<LayerCandidate>> needers = new ArrayList<>(); // consumed by wantedOn()
     // Layers resized from rss evidence this tick: layerId -> {effective core points,
     // effective memory KB}, read by planBookings so the commit books the same shape the
     // planner scored.
@@ -258,7 +266,7 @@ public class Scheduler extends JdbcDaoSupport {
     // Layer-placements planned this tick, for the tick-breakdown log line.
     private int lastPlacements;
 
-    // Consecutive ticks a layer was planned but planHost's commit-time read found zero frames: the
+    // Consecutive ticks a layer was planned but the plan found zero bookable frames: the
     // signature of a planner-vs-dispatch eligibility mismatch. Warns at plan_zero_warn_ticks.
     private final Map<String, Integer> planZeroStreak = new ConcurrentHashMap<>();
 
@@ -271,7 +279,7 @@ public class Scheduler extends JdbcDaoSupport {
     private final java.util.concurrent.atomic.AtomicLong launchDropped =
             new java.util.concurrent.atomic.AtomicLong(0);
 
-    // Pool for the plan phase: per-host plan reads (planHost) run in parallel, one task per host
+    // Pool for the plan phase: the window reads, then the per-host plans, run in parallel on it
     // (serial within a host so the capacity decrement is correct). Commit is still single/batched.
     private volatile ExecutorService readPool;
 
@@ -310,7 +318,7 @@ public class Scheduler extends JdbcDaoSupport {
     // snapshot for bug reports, emitted on every tick attempt (leader or standby) as a heartbeat.
 
     // Core points per whole core: OpenCue stores host/proc cores as cores * 100.
-    private static final int CORE_POINTS_PER_CORE = 100;
+    static final int CORE_POINTS_PER_CORE = 100;
 
     // Stat-line interval (scheduler.stat_interval_seconds, default 5 min).
     private volatile long statIntervalMs = 300_000;
@@ -607,7 +615,7 @@ public class Scheduler extends JdbcDaoSupport {
             // ThreadMode.ALL hosts run only threadable layers (bind 1 for ALL
             // groups, 0 otherwise), exactly the legacy dispatcher's clause.
             // Without it the planner parks non-threadable layers on ALL hosts
-            // (idle NIMBY workstations score best), planHost's re-check finds
+            // (idle NIMBY workstations score best), planFrames' re-check finds
             // zero frames, and the layer burns its one commit per tick forever.
             + "  AND  (CASE WHEN l.b_threadable = true THEN 1 ELSE 0 END) >= ? "
             + "  AND  ? ~* ('(?x)' || l.str_tags || '\\y') "
@@ -634,7 +642,7 @@ public class Scheduler extends JdbcDaoSupport {
             // enforces; -1 = unlimited). Same rationale as the limit filter: purely an
             // efficiency gate (don't plan bookings a full folder can't take). The exact
             // ceiling is enforced by the post-plan folder trim in doTick, which,
-            // unlike this filter, also binds the frames planHost books in the tick
+            // unlike this filter, also binds the frames planFrames books in the tick
             // that crosses the cap.
             + "  AND (COALESCE(fr.int_max_cores, -1) = -1 "
             + "       OR COALESCE(fu.folder_cores, 0) + l.int_cores_min <= fr.int_max_cores) "
@@ -845,6 +853,8 @@ public class Scheduler extends JdbcDaoSupport {
     /**
      * Expire cache-warmth entries displaced by a window's worth of foreign frames on their host.
      * Idle hosts' entries never expire because nothing displaced them.
+     *
+     * Bound: O(W) once per tick.
      */
     private void expireDisplacedWarmth() {
         if (warmthByHost.isEmpty())
@@ -1111,8 +1121,9 @@ public class Scheduler extends JdbcDaoSupport {
      * Drop reservation and blocked-debt state for layers that left the dispatchable set this tick,
      * so a layer that disappears and returns starts its block timer fresh.
      */
-    private void sweepStaleReservationState(Set<String> seenLayerIds) {
+    void sweepStaleReservationState(Set<String> seenLayerIds) {
         reservations.entrySet().removeIf(e -> !seenLayerIds.contains(e.getValue().layerId));
+        hostsByLayer.keySet().removeIf(layerId -> !seenLayerIds.contains(layerId));
         blockedDebtMs.keySet().removeIf(id -> !seenLayerIds.contains(id));
         lastSeenMs.keySet().removeIf(id -> !seenLayerIds.contains(id));
     }
@@ -1200,16 +1211,16 @@ public class Scheduler extends JdbcDaoSupport {
      */
     private void clearTickScratch() {
         plannedByHost.clear();
-        jobCoresUsed.clear();
-        showCoresUsed.clear();
-        limitUsed.clear();
-        folderUsed.clear();
+        jobCells.clear();
+        showCells.clear();
+        limitCells.clear();
+        folderCells.clear();
         folderMaxCp.clear();
         folderRunSeed.clear();
         jobFolderCap.clear();
         layerLicenses.clear();
         licenseBudgets.clear();
-        licenseUsed.clear();
+        licenseCells.clear();
         licenseSeats.clear();
         seenLayerIds.clear();
         reservationReqs.clear();
@@ -1226,6 +1237,8 @@ public class Scheduler extends JdbcDaoSupport {
      * idle, so a layer blocked on a partially-loaded reserved host stays a candidate and its
      * reservation survives the end-of-tick sweep. Returns the frames booked for the group and bumps
      * the matching stats counter (queryError / noWork / booked / noFit).
+     *
+     * Bound: one candidate query, the group loop, then O(H log W) for the stranded cores.
      */
     private int planGroup(HostSpecKey spec, List<BookableHost> fullGroup,
             SchedulerMetrics.TickStats stats) {
@@ -1272,8 +1285,7 @@ public class Scheduler extends JdbcDaoSupport {
         }
         resolveLicenseBudgets(candidates, layerLicenses, licenseBudgets);
         int booked = dispatchGroupWithScoring(idleGroup, fullGroup, candidates, seenLayerIds,
-                spec.pkAlloc, jobCoresUsed, showCoresUsed, limitUsed, folderUsed, reservationReqs,
-                licenseBudgets, licenseUsed, licenseSeats);
+                spec.pkAlloc, reservationReqs, licenseBudgets, licenseSeats);
         stats.strandedCores += strandedWholeCores(fullGroup, candidates);
         if (booked > 0)
             stats.booked++;
@@ -1313,6 +1325,10 @@ public class Scheduler extends JdbcDaoSupport {
      * into the idle subset while a layer that cannot fit collects a reservation request; 4. grant
      * reservations, plan the bookings in parallel, trim to the folder and license limits, commit
      * the survivors in one batch, and launch them. See planner.md for the full model.
+     *
+     * Bound: O(K + H) to drain and snapshot, the groups (see dispatchGroupWithScoring), one window
+     * read per planned layer, O(F) procs, F frames committed in chunks and F launches queued. The
+     * one product left is slots times classes of equal host state.
      *
      * @return frames committed this tick, or -1 for a standby that drained but did not plan.
      */
@@ -1422,6 +1438,8 @@ public class Scheduler extends JdbcDaoSupport {
      * for minutes and show nothing until the end. A chunk holds its locks for a bounded window,
      * lands its procs as it goes, and launches them as it goes. Each chunk commits with its own
      * resource deltas, so procs and their mirrors still land together or not at all.
+     *
+     * Bound: O(F) in F / COMMIT_CHUNK_FRAMES transactions.
      */
     private List<FrameBooking> commitInChunks(List<FrameBooking> planned) {
         List<FrameBooking> committed = new ArrayList<>();
@@ -1454,48 +1472,66 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /**
-     * Read each planned placement's next frames and build procs in memory (no DB writes),
-     * parallelized across hosts on the bounded read pool, the dominant tick cost as the farm fills.
-     * One task per host (not one thread), run at scheduler.read_pool_size concurrency: a host is
-     * booked serially within its task because planHost decrements that host's idle fields as it
-     * books, so a later layer sees what an earlier one took, and two tasks on one host would
-     * double-book it; different hosts run concurrently. A layer that plans but yields zero bookable
-     * frames for plan_zero_warn_ticks ticks in a row is warned (a commit-time gate the planner does
-     * not model is silently rejecting it, which would otherwise starve in silence). Returns the
-     * planned bookings, or null if the wait was interrupted (the caller then aborts the tick before
-     * committing).
+     * Read the frames of every planned layer and build procs in memory (no DB writes), in two
+     * rounds on the bounded read pool: one frame window per planned layer and thread-mode class,
+     * read against one of its planned hosts (the slice query's other host terms are layer terms
+     * every planned host satisfies), then one task per host that plans each pair from its range
+     * of the window; a host is booked serially within its task because planFrames decrements its
+     * idle fields as it books. A layer planned for plan_zero_warn_ticks ticks with zero bookable
+     * frames is warned. Returns null if a wait was interrupted.
+     *
+     * Bound: one query per planned layer and thread-mode class, then O(F) in memory.
      */
     private List<FrameBooking> planBookings(Map<String, BookableHost> hostById) {
         int planZeroWarnTicks =
                 env.getProperty("scheduler.plan_zero_warn_ticks", Integer.class, 40);
         lastPlacements = 0;
         Set<String> plannedLayerIds = new HashSet<>();
-        for (List<String> ls : plannedByHost.values()) {
-            lastPlacements += ls.size();
-            plannedLayerIds.addAll(ls);
+        Map<String, WindowRead> windowReads = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : plannedByHost.entrySet()) {
+            lastPlacements += e.getValue().size();
+            BookableHost h = hostById.get(e.getKey());
+            for (String layerId : e.getValue()) {
+                plannedLayerIds.add(layerId);
+                windowReads.putIfAbsent(windowKey(layerId, h), new WindowRead(layerId, h));
+            }
         }
+        Map<String, List<DispatchFrame>> windows = new ConcurrentHashMap<>();
+        List<Callable<Void>> reads = new ArrayList<>(windowReads.size());
+        for (Map.Entry<String, WindowRead> e : windowReads.entrySet()) {
+            final String key = e.getKey();
+            final WindowRead w = e.getValue();
+            reads.add(() -> {
+                // The window read binds the layer id only; no lookup needed.
+                windows.put(key, dispatchSupport.findNextDispatchFrames(new LayerEntity(w.layerId),
+                        dispatchHostOf(w.reader), plannedFramesByLayer.get(w.layerId)));
+                return null;
+            });
+        }
+        if (runAll(reads, "window reads") == null)
+            return null;
+
         List<Callable<List<FrameBooking>>> tasks = new ArrayList<>(plannedByHost.size());
         for (Map.Entry<String, List<String>> e : plannedByHost.entrySet()) {
             final String hostId = e.getKey();
             final List<String> layerIds = e.getValue();
             tasks.add(() -> {
                 List<FrameBooking> out = new ArrayList<>();
-                DispatchHost host = hostManager.getDispatchHost(hostId);
+                BookableHost snap = hostById.get(hostId);
+                DispatchHost host = dispatchHostOf(snap);
                 for (String layerId : layerIds) {
-                    LayerInterface layer = jobManager.getLayer(layerId);
                     // The rss resize the planner scored with, so the commit books the
                     // same shape. {cores, memKb}; absent = book the layer's own ask.
                     long[] rz = layerResize.get(layerId);
-                    int[] slice = hostById.get(hostId).planned.get(layerId);
-                    List<FrameBooking> got = dispatcher.planHost(host, layer,
-                            rz != null ? (int) rz[0] : 0, rz != null ? rz[1] : 0,
-                            slice != null ? slice[0] : 0, slice != null ? slice[1] : 0);
+                    List<FrameBooking> got = dispatcher.planFrames(host,
+                            sliceOf(windows.get(windowKey(layerId, snap)), snap.planned.get(layerId)),
+                            rz != null ? (int) rz[0] : 0, rz != null ? rz[1] : 0);
                     if (got.isEmpty()) {
                         int streak = planZeroStreak.merge(layerId, 1, Integer::sum);
                         if (streak % planZeroWarnTicks == 0) {
                             logger.warn("Scheduler: layer " + layerId + " planned " + streak
                                     + " consecutive ticks (last host " + host.getName()
-                                    + ") but planHost found 0 bookable frames each time."
+                                    + ") but planFrames found 0 bookable frames each time."
                                     + " A dispatch-query gate the planner does not model is"
                                     + " rejecting it (thread mode, limit, local booking, ...):"
                                     + " enable DEBUG on this class and read the 'Scheduler"
@@ -1510,32 +1546,73 @@ public class Scheduler extends JdbcDaoSupport {
             });
         }
         plannedByHost.clear();
-
+        List<List<FrameBooking>> got = runAll(tasks, "plan tasks");
+        if (got == null)
+            return null;
         List<FrameBooking> planned = new ArrayList<>();
-        int failedTasks = 0;
+        for (List<FrameBooking> g : got)
+            planned.addAll(g);
+        // Streaks matter only while the planner keeps choosing the layer; drop entries for
+        // layers not planned this tick so the map tracks live pathologies, not vanished work.
+        planZeroStreak.keySet().retainAll(plannedLayerIds);
+        return planned;
+    }
+
+    /** One frame window to read: a planned layer and a planned host of the thread-mode class. */
+    private static final class WindowRead {
+        final String layerId; // consumed by planBookings()
+        final BookableHost reader; // consumed by planBookings()
+
+        WindowRead(String layerId, BookableHost reader) {
+            this.layerId = layerId;
+            this.reader = reader;
+        }
+    }
+
+    /**
+     * The window a plan on host h for a layer reads from: the layer's, split only by the thread-mode
+     * class of the host, the one host term of the slice query the planner's groups do not share.
+     */
+    private static String windowKey(String layerId, BookableHost h) {
+        return h.threadMode == ThreadMode.ALL_VALUE ? layerId + "|all" : layerId;
+    }
+
+    /** The frames of one plan's slice {offset, size} within its layer's window, clipped to it. */
+    static List<DispatchFrame> sliceOf(List<DispatchFrame> window, int[] slice) {
+        if (window == null || slice == null)
+            return new ArrayList<>();
+        int from = Math.min(slice[0], window.size());
+        int to = Math.min(slice[0] + slice[1], window.size());
+        return window.subList(from, to);
+    }
+
+    /**
+     * Run the tasks on the read pool and collect the results of the ones that completed; a failed
+     * task is logged and skipped, an interrupted wait returns null.
+     */
+    private <T> List<T> runAll(List<Callable<T>> tasks, String what) {
+        List<T> out = new ArrayList<>(tasks.size());
+        int failed = 0;
         String firstCause = null;
         try {
-            for (Future<List<FrameBooking>> f : readPool.invokeAll(tasks)) {
+            for (Future<T> f : readPool.invokeAll(tasks)) {
                 try {
-                    planned.addAll(f.get());
+                    out.add(f.get());
                 } catch (ExecutionException ee) {
-                    failedTasks++;
+                    failed++;
                     if (firstCause == null)
                         firstCause = ee.getCause() != null ? ee.getCause().toString()
                                 : ee.toString();
                 }
             }
-            if (failedTasks > 0)
-                logger.warn("Scheduler: " + failedTasks + " of " + tasks.size()
-                        + " plan tasks failed this tick, first cause: " + firstCause);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return null;
         }
-        // Streaks matter only while the planner keeps choosing the layer; drop entries for
-        // layers not planned this tick so the map tracks live pathologies, not vanished work.
-        planZeroStreak.keySet().retainAll(plannedLayerIds);
-        return planned;
+        if (failed > 0)
+            logger.warn("Scheduler: " + failed + " of " + tasks.size() + " " + what
+                    + " failed this tick, first cause: " + firstCause);
+        return out;
     }
 
     /**
@@ -1619,6 +1696,8 @@ public class Scheduler extends JdbcDaoSupport {
      * counters. Called INSIDE the booking transaction, so a failure here rolls the bookings back
      * with it and there is nothing left over to retry: the procs those deltas describe never
      * existed. Skipped entirely when the Rust scheduler owns those tables.
+     *
+     * Bound: O(winners), then one update per distinct counter.
      */
     private void applyResourceDeltas(List<FrameBooking> committed) {
         if (!batchResourceAccounting || committed.isEmpty()) {
@@ -1639,6 +1718,8 @@ public class Scheduler extends JdbcDaoSupport {
      * This is also where locality cache-warmth is stamped, since the committed set is in hand:
      * every commit advances its host's odometer (displacing older cache), and a layer returning to
      * its own warm host re-stamps its entry instead of displacing it.
+     *
+     * Bound: O(F); the environments are read once per distinct job and layer.
      */
     private void launchCommitted(List<FrameBooking> committed) {
         if (localityEnabled && localityWindowFrames > 0) {
@@ -1651,11 +1732,12 @@ public class Scheduler extends JdbcDaoSupport {
                 }
             }
         }
+        LaunchEnv env = new LaunchEnv(); // consumed by runFrame()
         for (FrameBooking b : committed) {
             final FrameBooking fb = b;
             launchPool.execute(() -> {
                 try {
-                    dispatchSupport.runFrame(fb.proc, fb.frame);
+                    dispatchSupport.runFrame(fb.proc, fb.frame, env);
                 } catch (RqdLaunchUnknownOutcomeException e) {
                     // RQD may have started the frame: confirm before anything
                     // is released, else the frame could run twice.
@@ -1764,6 +1846,7 @@ public class Scheduler extends JdbcDaoSupport {
         // memory: reservations, blocked debt, warmth and odometers go with
         // the lock.
         reservations.clear();
+        hostsByLayer.clear();
         blockedDebtMs.clear();
         lastSeenMs.clear();
         warmthByHost.clear();
@@ -1858,6 +1941,8 @@ public class Scheduler extends JdbcDaoSupport {
      * maps for every host of every slot: the layers it runs and their frame counts, its plan
      * slices, its cache warmth and odometer, its reservation and its ready time. Bound once per
      * tick, after the reads that fill the maps; the plan slices start empty.
+     *
+     * Bound: O(H).
      */
     private void bindTickState(List<BookableHost> hosts) {
         for (BookableHost h : hosts) {
@@ -1868,7 +1953,40 @@ public class Scheduler extends JdbcDaoSupport {
             h.odometer = bookingsByHost.getOrDefault(h.hostId, 0L);
             h.reservation = reservations.get(h.hostId);
             h.tReady = tReadyByHost.get(h.hostId);
+            h.coresIdleAtBind = h.coresIdle;
+            h.memIdleAtBind = h.memIdle;
+            h.gpusIdleAtBind = h.gpusIdle;
+            h.gpuMemIdleAtBind = h.gpuMemIdle;
         }
+    }
+
+    /**
+     * The dispatch host the plan read books against, built from the tick's own snapshot instead
+     * of re-read from the database: the same row the planner scored, at the idle values it
+     * planned from (placement decrements the live ones). The snapshot holds only UP, OPEN hosts,
+     * so those two states are constants here. Saves one round trip per planned host; a host
+     * whose database row moved since the snapshot is caught by the commit's guarded update.
+     */
+    private static DispatchHost dispatchHostOf(BookableHost h) {
+        DispatchHost d = new DispatchHost();
+        d.id = h.hostId;
+        d.name = h.hostName;
+        d.allocationId = h.pkAlloc;
+        d.facilityId = h.pkFacility;
+        d.threadMode = h.threadMode;
+        d.cores = h.coresTotal;
+        d.memory = h.memTotal;
+        d.gpus = h.gpusTotal;
+        d.gpuMemory = h.gpuMemTotal;
+        d.idleCores = h.coresIdleAtBind;
+        d.idleMemory = h.memIdleAtBind;
+        d.idleGpus = h.gpusIdleAtBind;
+        d.idleGpuMemory = h.gpuMemIdleAtBind;
+        d.tags = h.tagsRaw;
+        d.setOs(h.os);
+        d.lockState = LockState.OPEN;
+        d.hardwareState = HardwareState.UP;
+        return d;
     }
 
     private Map<String, Set<String>> readHostLayerAffinity() {
@@ -1900,31 +2018,71 @@ public class Scheduler extends JdbcDaoSupport {
      * for a machine, no layer takes more than its share of it; with nobody else able to use the
      * machine, holding the cap would only strand it. Candidates later in the draw count as
      * waiting, which is the point: the yield must not run ahead of their turn.
+     *
+     * Bound: O(live wanters of the group).
      */
-    private boolean othersWant(BookableHost h, LayerCandidate c, List<LayerCandidate> candidates,
-            String groupAllocId, Map<String, Integer> jobCoresUsed,
-            Map<String, Integer> showCoresUsed, Map<String, Integer> limitUsed) {
-        for (LayerCandidate o : candidates) {
-            if (o == c || o.waitingFrameCount <= 0 || !fitsOnHost(o, h))
+    private boolean othersWant(BookableHost h, LayerCandidate c) {
+        for (int i = 0; i < alive.size();) {
+            LayerCandidate o = alive.get(i);
+            if (o.waitingFrameCount <= 0) {
+                dropAt(alive, i);
+                continue;
+            }
+            i++;
+            if (o == c || !fitsOnHost(o, h))
                 continue;
             if (layerFramesOn(h, o) >= layerHostCap(h, o))
                 continue;
-            if (openToPlace(o, groupAllocId, jobCoresUsed, showCoresUsed, limitUsed))
+            if (openToPlace(o))
                 return true;
         }
         return false;
     }
 
+    /**
+     * The group's waiting candidates, as one list and as one list per dimension they need. Both
+     * are walked by the strand and yield tests, which drop a candidate for good once its frames
+     * are gone, since waiting only falls within a group; open or closed is read live at each
+     * visit, since a negative-cores placement can reopen a cap. So a walk costs the live wanters
+     * it passes, not the group, and a dimension nobody waits for costs nothing.
+     *
+     * Bound: O(C x D).
+     */
+    void bindWaiting(List<LayerCandidate> candidates) {
+        alive.clear();
+        needers.clear();
+        for (Dim d : DIMS)
+            needers.add(new ArrayList<>());
+        for (LayerCandidate c : candidates) {
+            if (c.waitingFrameCount <= 0)
+                continue;
+            alive.add(c);
+            for (Dim d : DIMS)
+                if (d.need(c) > 0)
+                    needers.get(d.ordinal()).add(c);
+        }
+    }
+
+    private static void dropAt(List<LayerCandidate> list, int i) {
+        list.set(i, list.get(list.size() - 1));
+        list.remove(list.size() - 1);
+    }
+
+    /** Whether protecting d on a host can bound c at all: a dimension c needs is coupled to d. */
+    private boolean rowCouples(Dim d, LayerCandidate c) {
+        for (Dim e : DIMS)
+            if (reachNeeds[d.ordinal()][e.ordinal()] > 0 && e.need(c) > 0)
+                return true;
+        return false;
+    }
+
     /** Whether candidate o is held by none of its job, show or limit caps, read tick-wide. */
-    private static boolean openToPlace(LayerCandidate o, String groupAllocId,
-            Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed) {
-        if (jobCoresUsed.getOrDefault(o.jobId, o.jobCoresInUse) + o.layerCoresMin > o.jobMaxCores)
+    static boolean openToPlace(LayerCandidate o) {
+        if (o.jobCell.used + o.layerCoresMin > o.jobMaxCores)
             return false;
-        if (showCoresUsed.getOrDefault(subKey(o.showId, groupAllocId), o.showCoresInUse)
-                + o.layerCoresMin > o.showBurstCores)
+        if (o.showCell.used + o.layerCoresMin > o.showBurstCores)
             return false;
-        if (o.limitId != null && limitUsed.getOrDefault(o.limitId, o.limitRunning) >= o.limitMax)
+        if (o.limitCell != null && o.limitCell.used >= o.limitMax)
             return false;
         return true;
     }
@@ -1941,18 +2099,17 @@ public class Scheduler extends JdbcDaoSupport {
      * is cut to the value. "Could ever fit" rather than "fits now", so a host full of CPU work
      * drains toward the bundle as its frames finish. Nothing is protected when nobody waits for
      * the resource, and nothing bounds c when no resource on h is at stake.
+     *
+     * Bound: O(D), plus one wantedOn walk per coupled dimension at stake.
      */
-    private int strandFreeFrames(BookableHost h, LayerCandidate c, List<LayerCandidate> candidates,
-            String groupAllocId, Map<String, Integer> jobCoresUsed,
-            Map<String, Integer> showCoresUsed, Map<String, Integer> limitUsed) {
+    private int strandFreeFrames(BookableHost h, LayerCandidate c) {
         if (reachNeeds == null)
             return Integer.MAX_VALUE;
         long free = Integer.MAX_VALUE;
         for (Dim d : DIMS) {
-            if (d.need(c) > 0 || d.idle(h) <= 0)
+            if (d.need(c) > 0 || d.idle(h) <= 0 || !rowCouples(d, c))
                 continue;
-            if (!wantedOn(d, h, c, candidates, groupAllocId, jobCoresUsed, showCoresUsed,
-                    limitUsed))
+            if (!wantedOn(d, h, c))
                 continue;
             double keep = reach(d, h, c, reachNeeds, false);
             for (Dim e : DIMS) {
@@ -1966,16 +2123,21 @@ public class Scheduler extends JdbcDaoSupport {
         return (int) Math.max(0, free);
     }
 
-    /** Whether a waiting candidate other than c needs d, could ever fit on h and is open to place. */
-    private static boolean wantedOn(Dim d, BookableHost h, LayerCandidate c,
-            List<LayerCandidate> candidates, String groupAllocId,
-            Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed) {
-        for (LayerCandidate o : candidates) {
-            if (o == c || o.waitingFrameCount <= 0 || d.need(o) <= 0)
+    /**
+     * Whether a waiting candidate other than c needs d, could ever fit on h and is open to place.
+     *
+     * Bound: O(live needers of d).
+     */
+    boolean wantedOn(Dim d, BookableHost h, LayerCandidate c) {
+        List<LayerCandidate> list = needers.get(d.ordinal());
+        for (int i = 0; i < list.size();) {
+            LayerCandidate o = list.get(i);
+            if (o.waitingFrameCount <= 0) {
+                dropAt(list, i);
                 continue;
-            if (hostCanEverFit(o, h)
-                    && openToPlace(o, groupAllocId, jobCoresUsed, showCoresUsed, limitUsed))
+            }
+            i++;
+            if (o != c && hostCanEverFit(o, h) && openToPlace(o))
                 return true;
         }
         return false;
@@ -2313,14 +2475,15 @@ public class Scheduler extends JdbcDaoSupport {
      *
      * Layer ids are recorded in {@code seenLayerIds} so the end-of-tick sweep can drop reservations
      * for layers that left the dispatchable set.
+     *
+     * Bound: O(C x D + I log I) to bind; per slot O(shows + log C) to draw and O(classes + special
+     * hosts) to place; the epilogue O(I log I + U log I).
      */
     private int dispatchGroupWithScoring(List<BookableHost> hosts, List<BookableHost> fullHosts,
             List<LayerCandidate> candidates, Set<String> seenLayerIds, String groupAllocId,
-            Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed, Map<String, Integer> folderUsed,
             List<ReservationRequest> reservationReqs,
             Map<String, LicenseSource.LicenseBudget> licenseBudgets,
-            Map<String, Integer> licenseUsed, Map<String, Set<String>> licenseSeats) {
+            Map<String, Set<String>> licenseSeats) {
         int dispatched = 0;
         // Largest host in this group, for the reservation width gate below: a
         // layer may reserve only if its per-frame cores are a big enough fraction
@@ -2340,8 +2503,11 @@ public class Scheduler extends JdbcDaoSupport {
             c.waitingFrameCount -= plannedFramesByLayer.getOrDefault(c.layerId, 0);
             c.placedThisTick = false;
             c.showKey = subKey(c.showId, groupAllocId);
+            bindCells(c);
         }
         reachNeeds = reachNeedsOf(candidates);
+        bindWaiting(candidates);
+        classes = new HostClasses(hosts);
 
         // Placement slots: every slot goes first to the show with the lowest
         // tier on this allocation (cores in use over subscription size, read
@@ -2355,32 +2521,26 @@ public class Scheduler extends JdbcDaoSupport {
         // placement instead of once per tick, so a tick's capacity splits by
         // priority however much of it there is. A candidate leaves the draw
         // when it places nothing (capped, out of probe headroom, no host left)
-        // or runs out of frames; a show whose candidates all left yields the
-        // slot to the next tier in the same tick.
-        List<LayerCandidate> active = new ArrayList<>(candidates.size());
-        for (LayerCandidate c : candidates) {
-            if (c.waitingFrameCount > 0)
-                active.add(c);
-        }
-        while (!active.isEmpty()) {
-            int idx = drawSlot(active, groupAllocId, showCoresUsed);
-            LayerCandidate c = active.get(idx);
-            int got = placeOnce(c, hosts, candidates, groupAllocId, jobCoresUsed, showCoresUsed,
-                    limitUsed, folderUsed, licenseBudgets, licenseUsed, licenseSeats);
+        // or runs out of frames, and one no idle host fits never enters it
+        // (see fitting); a show whose candidates all left yields the slot to
+        // the next tier in the same tick.
+        SlotDraw draw = new SlotDraw(fitting(candidates, new GroupViews.IdleView(hosts)));
+        while (!draw.isEmpty()) {
+            LayerCandidate c = draw.next(ThreadLocalRandom.current().nextDouble());
+            int got = placeOnce(c, hosts, candidates, licenseBudgets, licenseSeats);
             if (got > 0)
                 dispatched += got;
-            if (got <= 0 || c.waitingFrameCount <= 0) {
-                active.set(idx, active.get(active.size() - 1));
-                active.remove(active.size() - 1);
-            }
+            if (got <= 0 || c.waitingFrameCount <= 0)
+                draw.remove(c);
         }
 
-        // Epilogue, once per candidate, against the end-of-tick gate.
+        // Epilogue, once per candidate, against the end-of-tick gate and one sorted view of the
+        // idle hosts, built once here: the state is frozen from this point on.
+        GroupViews.IdleView idle = new GroupViews.IdleView(hosts);
         for (LayerCandidate c : candidates) {
             if (c.waitingFrameCount <= 0 && !c.placedThisTick)
                 continue;
-            CandidateGate g = gate(c, groupAllocId, jobCoresUsed, showCoresUsed, limitUsed,
-                    folderUsed, licenseBudgets, licenseUsed, licenseSeats);
+            CandidateGate g = gate(c, licenseBudgets, licenseSeats);
             if (c.licenses != null && (g.licenseHeld || g.licenseUsable <= 0))
                 tickLicenseHeld++;
             boolean placed = c.placedThisTick;
@@ -2427,9 +2587,8 @@ public class Scheduler extends JdbcDaoSupport {
             if (c.waitingFrameCount > 0) {
                 waitReasonByLayer.put(c.layerId,
                         placed ? "flowing"
-                                : waitlistReason(c, hosts, limitInUse, folderInUse, licenseHeld,
-                                        licenseUsable, licenseSeatPools, licenseSeats, candidates,
-                                        groupAllocId, jobCoresUsed, showCoresUsed, limitUsed));
+                                : waitlistReason(c, idle, limitInUse, folderInUse, licenseHeld,
+                                        licenseUsable, licenseSeatPools, licenseSeats));
                 waitFramesByLayer.put(c.layerId, c.waitingFrameCount);
             } else if (placed) {
                 waitReasonByLayer.remove(c.layerId);
@@ -2477,54 +2636,58 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /** The draw weight of a candidate: its job priority, floored at 1 like the query's GREATEST. */
-    private static long lotteryWeight(LayerCandidate c) {
+    static long lotteryWeight(LayerCandidate c) {
         return Math.max(1, c.priority);
     }
 
     /**
-     * The candidate that takes the next placement slot: a priority-weighted draw among the
-     * candidates of the lowest-tier show in {@code active}. Tiers are read against the tick-wide
-     * show cores map, so every placement of this tick moves its show before the next draw. Ties
-     * are exact, since the candidates of one show share one tier value.
-     */
-    private static int drawSlot(List<LayerCandidate> active, String groupAllocId,
-            Map<String, Integer> showCoresUsed) {
-        double low = Double.POSITIVE_INFINITY;
-        for (LayerCandidate c : active) {
-            c.tier = showTier(c, showCoresUsed);
-            low = Math.min(low, c.tier);
-        }
-        long weightSum = 0;
-        for (LayerCandidate c : active) {
-            if (c.tier <= low)
-                weightSum += lotteryWeight(c);
-        }
-        long r = (long) (ThreadLocalRandom.current().nextDouble() * weightSum);
-        int last = 0;
-        for (int i = 0; i < active.size(); i++) {
-            LayerCandidate c = active.get(i);
-            if (c.tier > low)
-                continue;
-            last = i;
-            if ((r -= lotteryWeight(c)) < 0)
-                return i;
-        }
-        return last;
-    }
-
-    /**
      * The tier of a candidate's show on this allocation: the legacy dispatcher's subscription tier
-     * (the database's tier() function) read tick-wide. Cores in use over subscription size; a show
-     * running nothing sorts below every other, at minus its size; a show with no size has no
-     * guarantee and sorts by its cores above every show that has one. Lower runs first.
+     * (the database's tier() function) read tick-wide, once per show per slot by SlotDraw. Cores
+     * in use over subscription size; a show running nothing sorts below every other, at minus its
+     * size; a show with no size has no guarantee and sorts by its cores above every show that has
+     * one. Lower runs first.
      */
-    private static double showTier(LayerCandidate c, Map<String, Integer> showCoresUsed) {
-        int cores = showCoresUsed.getOrDefault(c.showKey, c.showCoresInUse);
+    static double showTier(LayerCandidate c) {
+        int cores = c.showCell.used;
         if (c.showSizeCores == 0)
             return cores / 100.0 + 1;
         if (cores == 0)
             return -c.showSizeCores;
         return (double) cores / c.showSizeCores;
+    }
+
+    /**
+     * Bind a candidate to its tick-wide cap counters: one cell per job, subscription (show and
+     * allocation), limit, folder and license pool. A cell is seeded from the candidate's row the
+     * first time its key is seen in the tick and shared by every later candidate of that key, in
+     * this group or a later one, so every cap read is a field read and a spend on one candidate is
+     * seen by all of them without a lookup. Null where the candidate has no limit or no folder cap.
+     */
+    void bindCells(LayerCandidate c) {
+        c.jobCell = cell(jobCells, c.jobId, c.jobCoresInUse);
+        c.showCell = cell(showCells, c.showKey, c.showCoresInUse);
+        c.limitCell = c.limitId == null ? null : cell(limitCells, c.limitId, c.limitRunning);
+        c.folderCell = c.folderMax < 0 ? null : cell(folderCells, c.folderId, c.folderRunning);
+        if (c.licenses != null) {
+            c.licenseCells = new Cell[c.licenses.size()];
+            for (int i = 0; i < c.licenseCells.length; i++)
+                c.licenseCells[i] = cell(licenseCells, c.licenses.get(i), 0);
+        }
+    }
+
+    private static Cell cell(Map<String, Cell> cells, String key, int seed) {
+        Cell x = cells.get(key);
+        if (x == null) {
+            x = new Cell();
+            x.used = seed;
+            cells.put(key, x);
+        }
+        return x;
+    }
+
+    /** A tick-wide cap counter shared by every candidate of one key. */
+    static final class Cell {
+        int used;
     }
 
     /** Tick-wide cap state of one candidate, read fresh at every slot and once in the epilogue. */
@@ -2542,25 +2705,23 @@ public class Scheduler extends JdbcDaoSupport {
      * can hold it: job max cores, show burst (keyed on the subscription, not the show: a show with
      * two allocations has two bursts), the limit, the folder core ceiling, and the live application
      * licenses (a seat is needed in every pool the layer declares; floating pools allow the minimum
-     * of their remaining counts, host-based pools are gated per host in placeOnce). Each tick-wide
-     * map is seeded from the DB snapshot the first time its key is seen and read back after, so
-     * placements made earlier this tick, here or in another group, count against this candidate.
-     * Idempotent: placeOnce calls it before every attempt, the epilogue once more.
+     * of their remaining counts, host-based pools are gated per host in placeOnce). Every counter
+     * is the candidate's cell, bound in the group prologue (bindCells), so placements made earlier
+     * this tick, here or in another group, count against this candidate. Idempotent: placeOnce
+     * calls it before every attempt, the epilogue once more.
+     *
+     * Bound: O(1), plus one step per license of the layer.
      */
-    private CandidateGate gate(LayerCandidate c, String groupAllocId,
-            Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed, Map<String, Integer> folderUsed,
+    private CandidateGate gate(LayerCandidate c,
             Map<String, LicenseSource.LicenseBudget> licenseBudgets,
-            Map<String, Integer> licenseUsed, Map<String, Set<String>> licenseSeats) {
+            Map<String, Set<String>> licenseSeats) {
         CandidateGate g = new CandidateGate();
-        c.jobCoresInUse = jobCoresUsed.computeIfAbsent(c.jobId, k -> c.jobCoresInUse);
-        c.showCoresInUse = showCoresUsed.computeIfAbsent(subKey(c.showId, groupAllocId),
-                k -> c.showCoresInUse);
-        g.limitInUse = (c.limitId != null)
-                ? limitUsed.computeIfAbsent(c.limitId, k -> c.limitRunning)
-                : 0;
+        c.jobCoresInUse = c.jobCell.used;
+        c.showCoresInUse = c.showCell.used;
+        g.limitInUse = c.limitCell == null ? 0 : c.limitCell.used;
         if (c.licenses != null) {
-            for (String licName : c.licenses) {
+            for (int i = 0; i < c.licenses.size(); i++) {
+                String licName = c.licenses.get(i);
                 LicenseSource.LicenseBudget b = licenseBudgets.get(licName);
                 if (b == null || b.stale) {
                     g.licenseHeld = true;
@@ -2572,15 +2733,13 @@ public class Scheduler extends JdbcDaoSupport {
                     g.licenseSeatPools.add(b);
                     licenseSeats.computeIfAbsent(licName, k -> new HashSet<>(b.seats));
                 } else {
-                    int remaining = b.usable - licenseUsed.computeIfAbsent(licName, k -> 0);
+                    int remaining = b.usable - c.licenseCells[i].used;
                     if (remaining < g.licenseUsable)
                         g.licenseUsable = remaining;
                 }
             }
         }
-        g.folderInUse = (c.folderMax >= 0)
-                ? folderUsed.computeIfAbsent(c.folderId, k -> c.folderRunning)
-                : 0;
+        g.folderInUse = c.folderCell == null ? 0 : c.folderCell.used;
         // A capped layer (job/show cap, full limit, folder ceiling, licenses) must
         // not dispatch but must still reconcile, dropping reservations it can no
         // longer use so other work can take those hosts.
@@ -2593,21 +2752,20 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /**
-     * One placement attempt for candidate c: the gate, the probe headroom, the host scan (every
-     * fitting host scored with placementScore under the reservation, seat, per-host-plan and
-     * soft-cap gates; the soft cap yields only on a host nobody else wants, see othersWant), the
-     * frame estimate, then the bookkeeping that makes the tick's later candidates see the spend,
-     * and submitCommit. Returns the frames planned, 0 when the candidate is capped, out of probe
-     * headroom, or has no host left this tick.
+     * One placement attempt for candidate c: the gate, the probe headroom, the host scan (see
+     * pickHost, over one host per class of equal state and c's special hosts), the frame estimate,
+     * then the bookkeeping that makes the tick's later candidates see the spend, and submitCommit.
+     * Returns the frames planned, 0 when the candidate is capped, out of probe headroom, or has no
+     * host left this tick.
+     *
+     * Bound: O(classes + special hosts of c) for the scan, O(log I) to move the placed host, O(1)
+     * for the rest.
      */
     private int placeOnce(LayerCandidate c, List<BookableHost> hosts,
-            List<LayerCandidate> candidates, String groupAllocId,
-            Map<String, Integer> jobCoresUsed, Map<String, Integer> showCoresUsed,
-            Map<String, Integer> limitUsed, Map<String, Integer> folderUsed,
+            List<LayerCandidate> candidates,
             Map<String, LicenseSource.LicenseBudget> licenseBudgets,
-            Map<String, Integer> licenseUsed, Map<String, Set<String>> licenseSeats) {
-        CandidateGate g = gate(c, groupAllocId, jobCoresUsed, showCoresUsed, limitUsed, folderUsed,
-                licenseBudgets, licenseUsed, licenseSeats);
+            Map<String, Set<String>> licenseSeats) {
+        CandidateGate g = gate(c, licenseBudgets, licenseSeats);
         if (g.capped)
             return 0;
         int licenseUsable = g.licenseUsable;
@@ -2623,19 +2781,126 @@ public class Scheduler extends JdbcDaoSupport {
             if (probeHeadroom <= 0)
                 return 0;
         }
-        BookableHost best = null;
-        BookableHost cappedFallback = null;
-        double bestScore = Double.POSITIVE_INFINITY;
-        int bestStrandFree = Integer.MAX_VALUE;
-        int fallbackStrandFree = Integer.MAX_VALUE;
-        for (BookableHost h : hosts) {
+        Pick p = pickHost(c, classes.candidates(c, licenseSeatPools, licenseSeats),
+                licenseSeatPools, licenseSeats);
+        BookableHost best = p.best;
+        int bestStrandFree = p.bestStrandFree;
+        boolean overCap = false;
+        if (best == null && p.fallback != null) {
+            // Soft cap: the only thing between this layer and an idle
+            // machine was the cap. Give it the machine.
+            best = p.fallback;
+            bestStrandFree = p.fallbackStrandFree;
+            overCap = true;
+        }
+        if (best == null)
+            return 0; // no host can fit this layer
+
+        // Estimate how many frames this commit will book. The
+        // dispatcher books up to job_frame_dispatch_max per call,
+        // bounded by the same fit checks placementScore uses.
+        int estFrames = headroomFrames(c, best, overCap, probeHeadroom, licenseUsable,
+                bestStrandFree);
+        if (estFrames <= 0)
+            return 0;
+
+        // The locality dial: classify the chosen host here, before this
+        // commit moves any of the maps the bonus scored.
+        lastTickStats.bookedFramesByLocality.merge(localityKind(best, c), (long) estFrames,
+                Long::sum);
+
+        int estCores = estFrames * c.layerCoresMin;
+        long estMem = (long) estFrames * c.layerMemMin;
+        int estGpus = estFrames * c.layerGpusMin;
+        long estGpuMem = (long) estFrames * c.layerGpuMemMin;
+
+        for (Dim d : DIMS)
+            d.take(best, (long) estFrames * d.need(c));
+        c.jobCell.used += estCores;
+        c.showCell.used += estCores;
+        c.jobCoresInUse = c.jobCell.used;
+        c.showCoresInUse = c.showCell.used;
+        c.waitingFrameCount -= estFrames;
+        if (layerHostMaxFrac > 0)
+            best.layerFrames.merge(c.layerId, estFrames, Integer::sum);
+        if (!c.rssProven)
+            layerProbeUsed.merge(c.layerId, estFrames, Integer::sum);
+        if (c.limitCell != null)
+            c.limitCell.used += estFrames;
+        if (c.folderCell != null)
+            c.folderCell.used += estCores;
+        // Spend the licenses: a frame is a seat in each floating pool, and
+        // this host now holds a seat in each host-based one. Both are
+        // tick-wide so every later candidate of the same pool, in any
+        // group, sees the spend.
+        if (c.licenses != null) {
+            if (licenseUsable != Integer.MAX_VALUE)
+                licenseUsable -= estFrames;
+            for (int i = 0; i < c.licenses.size(); i++) {
+                String licName = c.licenses.get(i);
+                LicenseSource.LicenseBudget b = licenseBudgets.get(licName);
+                if (b == null)
+                    continue;
+                if (b.hostBased) {
+                    Set<String> seats = licenseSeats.get(licName);
+                    if (seats.add(best.hostName.toLowerCase())) {
+                        logger.info("Scheduler license: new seat " + seats.size() + "/"
+                                + b.seatCap + " on host " + best.hostName + " for license "
+                                + licName);
+                    }
+                } else {
+                    c.licenseCells[i].used += estFrames;
+                }
+            }
+            tickLicenseBooked += estFrames;
+        }
+
+        // Count an EASY-backfill borrow for the stat line: this host
+        // is reserved for someone else and only backfillAllows let us
+        // in.
+        if (!reservationAllows(best, c)) {
+            tickBackfilled++;
+            tickBackfilledCores += estCores;
+        }
+
+        // No seize-on-dispatch: reservations are firm (see reservationAllows), so a host
+        // reached here is either its owner booking after the drain or an EASY-backfill
+        // borrow. A borrow never takes ownership, so the reservation is left intact.
+        submitCommit(best, c.layerId, estFrames);
+        classes.move(best);
+        c.placedThisTick = true;
+        return estFrames;
+    }
+
+    /** One slot's scan outcome: the best host, the soft cap's fallback, their strand-free frames. */
+    static final class Pick {
+        BookableHost best; // consumed by placeOnce()
+        BookableHost fallback; // consumed by placeOnce()
+        int bestStrandFree = Integer.MAX_VALUE; // consumed by placeOnce()
+        int fallbackStrandFree = Integer.MAX_VALUE; // consumed by placeOnce()
+        double bestScore = Double.POSITIVE_INFINITY; // consumed by pickHost()
+    }
+
+    /**
+     * The host scan of one slot over the hosts to visit: every fitting host scored with
+     * placementScore under the reservation, seat, per-host-plan and soft-cap gates. The best host
+     * is the lowest score, the lowest index among equals; the fallback is the lowest-index host
+     * held by the cap alone. Both read the host's index, not the visit order, so the pick is the
+     * same whichever host stands for its class (see HostClasses).
+     *
+     * Bound: one gate and one score per host visited.
+     */
+    Pick pickHost(LayerCandidate c, List<BookableHost> visit,
+            List<LicenseSource.LicenseBudget> licenseSeatPools,
+            Map<String, Set<String>> licenseSeats) {
+        Pick p = new Pick();
+        for (BookableHost h : visit) {
             if (!fitsOnHost(c, h))
                 continue;
             // A host is not given away while work that needs one of its idle
             // resources is waiting: the bundle that resource needs stays,
             // and the slice is cut to what lies beyond it.
-            int strandFree = strandFreeFrames(h, c, candidates, groupAllocId, jobCoresUsed,
-                    showCoresUsed, limitUsed);
+            int strandFree = strandFreeFrames(h, c);
             if (strandFree <= 0)
                 continue;
             // Same gate for a host-based license pool, but keyed by host
@@ -2667,10 +2932,10 @@ public class Scheduler extends JdbcDaoSupport {
             // candidate could still use (othersWant). Unproven layers
             // never get the fallback (the probe gate is their brake).
             if (layerHostMaxFrac > 0 && layerFramesOn(h, c) >= layerHostCap(h, c)) {
-                if (cappedFallback == null && c.rssProven && !othersWant(h, c,
-                        candidates, groupAllocId, jobCoresUsed, showCoresUsed, limitUsed)) {
-                    cappedFallback = h;
-                    fallbackStrandFree = strandFree;
+                if (c.rssProven && (p.fallback == null || h.ix < p.fallback.ix)
+                        && !othersWant(h, c)) {
+                    p.fallback = h;
+                    p.fallbackStrandFree = strandFree;
                 }
                 continue;
             }
@@ -2710,111 +2975,48 @@ public class Scheduler extends JdbcDaoSupport {
                         score -= licenseSeatBonus;
                 }
             }
-            if (score < bestScore) {
-                bestScore = score;
-                best = h;
-                bestStrandFree = strandFree;
+            if (score < p.bestScore
+                    || (score == p.bestScore && p.best != null && h.ix < p.best.ix)) {
+                p.bestScore = score;
+                p.best = h;
+                p.bestStrandFree = strandFree;
             }
         }
-        boolean overCap = false;
-        if (best == null && cappedFallback != null) {
-            // Soft cap: the only thing between this layer and an idle
-            // machine was the cap. Give it the machine.
-            best = cappedFallback;
-            bestStrandFree = fallbackStrandFree;
-            overCap = true;
-        }
-        if (best == null)
-            return 0; // no host can fit this layer
-
-        // Estimate how many frames this commit will book. The
-        // dispatcher books up to job_frame_dispatch_max per call,
-        // bounded by the same fit checks placementScore uses.
-        int estFrames = headroomFrames(c, best, overCap, probeHeadroom, limitUsed,
-                licenseUsable, folderUsed, bestStrandFree);
-        if (estFrames <= 0)
-            return 0;
-
-        // The locality dial: classify the chosen host here, before this
-        // commit moves any of the maps the bonus scored.
-        lastTickStats.bookedFramesByLocality.merge(localityKind(best, c), (long) estFrames,
-                Long::sum);
-
-        int estCores = estFrames * c.layerCoresMin;
-        long estMem = (long) estFrames * c.layerMemMin;
-        int estGpus = estFrames * c.layerGpusMin;
-        long estGpuMem = (long) estFrames * c.layerGpuMemMin;
-
-        for (Dim d : DIMS)
-            d.take(best, (long) estFrames * d.need(c));
-        c.jobCoresInUse += estCores;
-        c.showCoresInUse += estCores;
-        c.waitingFrameCount -= estFrames;
-        // Publish back so other candidates of the same job/show this
-        // tick see the updated usage.
-        jobCoresUsed.put(c.jobId, c.jobCoresInUse);
-        showCoresUsed.put(subKey(c.showId, groupAllocId), c.showCoresInUse);
-        if (layerHostMaxFrac > 0)
-            best.layerFrames.merge(c.layerId, estFrames, Integer::sum);
-        if (!c.rssProven)
-            layerProbeUsed.merge(c.layerId, estFrames, Integer::sum);
-        if (c.limitId != null)
-            limitUsed.merge(c.limitId, estFrames, Integer::sum);
-        if (c.folderMax >= 0)
-            folderUsed.merge(c.folderId, estCores, Integer::sum);
-        // Spend the licenses: a frame is a seat in each floating pool, and
-        // this host now holds a seat in each host-based one. Both are
-        // tick-wide so every later candidate of the same pool, in any
-        // group, sees the spend.
-        if (c.licenses != null) {
-            if (licenseUsable != Integer.MAX_VALUE)
-                licenseUsable -= estFrames;
-            for (String licName : c.licenses) {
-                LicenseSource.LicenseBudget b = licenseBudgets.get(licName);
-                if (b == null)
-                    continue;
-                if (b.hostBased) {
-                    Set<String> seats = licenseSeats.get(licName);
-                    if (seats.add(best.hostName.toLowerCase())) {
-                        logger.info("Scheduler license: new seat " + seats.size() + "/"
-                                + b.seatCap + " on host " + best.hostName + " for license "
-                                + licName);
-                    }
-                } else {
-                    licenseUsed.merge(licName, estFrames, Integer::sum);
-                }
-            }
-            tickLicenseBooked += estFrames;
-        }
-
-        // Count an EASY-backfill borrow for the stat line: this host
-        // is reserved for someone else and only backfillAllows let us
-        // in.
-        if (!reservationAllows(best, c)) {
-            tickBackfilled++;
-            tickBackfilledCores += estCores;
-        }
-
-        // No seize-on-dispatch: reservations are firm (see reservationAllows), so a host
-        // reached here is either its owner booking after the drain or an EASY-backfill
-        // borrow. A borrow never takes ownership, so the reservation is left intact.
-        submitCommit(best, c.layerId, estFrames);
-        c.placedThisTick = true;
-        return estFrames;
-
+        return p;
     }
 
-    /** True if any host is currently reserved for this layer. */
-    private boolean layerHoldsReservation(String layerId) {
-        for (Reservation r : reservations.values()) {
-            if (r.layerId.equals(layerId))
-                return true;
-        }
-        return false;
+    /** True if any host is currently reserved for this layer. O(1): one probe of the index. */
+    boolean layerHoldsReservation(String layerId) {
+        return hostsByLayer.containsKey(layerId);
+    }
+
+    /**
+     * Reserve a host for a layer, or release it, keeping the index by layer in step with the map:
+     * a layer holds a reservation exactly when its set in the index is non-empty. O(1) each.
+     */
+    void reserve(String hostId, Reservation r) {
+        reservations.put(hostId, r);
+        hostsByLayer.computeIfAbsent(r.layerId, k -> new LinkedHashSet<>()).add(hostId);
+    }
+
+    void release(String hostId) {
+        Reservation r = reservations.remove(hostId);
+        if (r == null)
+            return;
+        Set<String> mine = hostsByLayer.get(r.layerId);
+        mine.remove(hostId);
+        if (mine.isEmpty())
+            hostsByLayer.remove(r.layerId);
+    }
+
+    /** The hosts reserved for a layer, in the order they were reserved. */
+    List<String> hostsReservedFor(String layerId) {
+        Set<String> mine = hostsByLayer.get(layerId);
+        return mine == null ? new ArrayList<>() : new ArrayList<>(mine);
     }
 
     /** Whether host h has enough total capacity to run a frame of c when idle. */
-    private static boolean hostCanEverFit(LayerCandidate c, BookableHost h) {
+    static boolean hostCanEverFit(LayerCandidate c, BookableHost h) {
         for (Dim d : DIMS) {
             if (d.total(h) < d.need(c))
                 return false;
@@ -2949,14 +3151,12 @@ public class Scheduler extends JdbcDaoSupport {
      * host runs its owner and then frees up. So c sheds hosts only when its own demand falls
      * (frames dispatched or the layer capped), least-drained first via
      * {@link #releaseSurplusReservations}, and claims more, up to its remaining cap headroom, via
-     * {@link #pickReservationTarget}.
+     * {@link #reservationTargets}.
+     *
+     * Bound: O(H log H) per request; the layer's own hosts come from the index.
      */
     private void reconcileReservationsForLayer(LayerCandidate c, List<BookableHost> hosts) {
-        List<String> mine = new ArrayList<>();
-        for (Map.Entry<String, Reservation> e : reservations.entrySet()) {
-            if (e.getValue().layerId.equals(c.layerId))
-                mine.add(e.getKey());
-        }
+        List<String> mine = hostsReservedFor(c.layerId);
 
         int have = mine.size();
         int framesNeed = Math.max(0, c.waitingFrameCount);
@@ -2991,12 +3191,8 @@ public class Scheduler extends JdbcDaoSupport {
         } else if (have < need) {
             int headroom = Math.max(0, capTotal - reservedByOthers - have);
             int want = Math.min(need - have, headroom);
-            for (int i = 0; i < want; i++) {
-                BookableHost t = pickReservationTarget(c, hosts);
-                if (t == null)
-                    break; // no free eligible host
-                reservations.put(t.hostId, new Reservation(c.layerId, c.priority, c.layerCoresMin));
-            }
+            for (BookableHost t : reservationTargets(c, hosts, want))
+                reserve(t.hostId, new Reservation(c.layerId, c.priority, c.layerCoresMin));
         }
     }
 
@@ -3011,40 +3207,32 @@ public class Scheduler extends JdbcDaoSupport {
         Map<String, Integer> idleByHost = new HashMap<>();
         for (BookableHost h : hosts)
             idleByHost.put(h.hostId, h.coresIdle);
-        mine.sort((a, b) -> Integer.compare(idleByHost.getOrDefault(b, 0),
-                idleByHost.getOrDefault(a, 0)));
+        // Idle cores descending, host id ascending among equals: a total order, so the
+        // choice does not depend on the order the hosts were reserved in.
+        mine.sort((a, b) -> {
+            int byIdle = Integer.compare(idleByHost.getOrDefault(b, 0), idleByHost.getOrDefault(a, 0));
+            return byIdle != 0 ? byIdle : a.compareTo(b);
+        });
         for (String hostId : mine.subList(Math.min(keep, mine.size()), mine.size()))
-            reservations.remove(hostId);
+            release(hostId);
     }
 
     /**
-     * Pick the host most likely to become available for c soonest, expressed as "host with the
-     * fewest running procs": fewer running frames means fewer to wait on before the host frees up
-     * enough cores for c. The host must (a) be tag/OS-compatible (granted by group membership), (b)
-     * have enough total capacity for c when fully idle, (c) not already be reserved by c (reconcile
-     * only expands the set, never re-claims), and (d) not be reserved at equal or higher priority
-     * for a different layer.
+     * The {@code want} free hosts most likely to become available for c soonest: fewest running
+     * procs first, among the hosts whose totals fit c. Firm reservations: the claim only ever
+     * expands into a free host and never takes a held one, so a low-priority grant is not clawed
+     * back; own hosts are already counted in 'have'.
+     *
+     * Bound: O(H log H), one pass and one stable sort, which picks what a repeated argmin picks.
      */
-    private BookableHost pickReservationTarget(LayerCandidate c, List<BookableHost> hosts) {
-        BookableHost best = null;
-        int bestProcs = Integer.MAX_VALUE;
+    List<BookableHost> reservationTargets(LayerCandidate c, List<BookableHost> hosts, int want) {
+        List<BookableHost> free = new ArrayList<>();
         for (BookableHost h : hosts) {
-            if (!hostCanEverFit(c, h))
-                continue;
-            // Firm reservations: only ever expand into a free host. A held host is
-            // never taken from its owner, not even by a higher-priority reserver, so a
-            // low-priority job's lottery-won grant is not clawed back; it frees only
-            // when its owner's demand drops (releaseSurplusReservations) or the layer
-            // leaves. Own hosts are already counted in 'have', so skipping every
-            // reserved host covers them too.
-            if (reservations.get(h.hostId) != null)
-                continue;
-            if (h.runningProcs < bestProcs) {
-                bestProcs = h.runningProcs;
-                best = h;
-            }
+            if (hostCanEverFit(c, h) && reservations.get(h.hostId) == null)
+                free.add(h);
         }
-        return best;
+        free.sort((a, b) -> Integer.compare(a.runningProcs, b.runningProcs));
+        return free.subList(0, Math.min(want, free.size()));
     }
 
     /**
@@ -3096,6 +3284,43 @@ public class Scheduler extends JdbcDaoSupport {
     }
 
     /**
+     * Frames one commit may book for candidate c on host best: the minimum of every sizing rule,
+     * each term named. Zero or less means stop booking this candidate this tick. A soft-cap grant
+     * (overCap) skips the per-host layer-cap term; the cap already yielded for this booking.
+     *
+     * Bound: O(D).
+     */
+    private int headroomFrames(LayerCandidate c, BookableHost best, boolean overCap,
+            int probeHeadroom, int licenseUsable, int strandFree) {
+        long maxMore = computeMaxMore(best, c);
+        // Commit size: one plan slice.
+        int est = (int) Math.min(frameQueryMax, maxMore + 1);
+        // Backlog: never book frames the layer does not have.
+        est = Math.min(est, c.waitingFrameCount);
+        // Strand bundle: what lies beyond the reach waiting work keeps on this host.
+        est = Math.min(est, strandFree);
+        // Probe: an unproven layer's remaining farm-wide allowance.
+        est = Math.min(est, probeHeadroom);
+        // Named limit: the tick-wide running count is authoritative.
+        if (c.limitCell != null)
+            est = Math.min(est, c.limitMax - c.limitCell.used);
+        // Licenses: one frame is one seat, floating pools shared tick-wide.
+        if (licenseUsable != Integer.MAX_VALUE)
+            est = Math.min(est, licenseUsable);
+        // Folder ceiling (cores, not frames).
+        if (c.folderCell != null && c.layerCoresMin > 0)
+            est = Math.min(est, (c.folderMax - c.folderCell.used) / c.layerCoresMin);
+        // Per-host layer cap: skipped when the cap already yielded.
+        if (!overCap && layerHostMaxFrac > 0) {
+            int hlCap = layerHostCap(best, c);
+            if (hlCap != Integer.MAX_VALUE)
+                est = Math.min(est,
+                        hlCap - layerFramesOn(best, c));
+        }
+        return est;
+    }
+
+    /**
      * Predict the number of additional frames of c (beyond the first) that could be dispatched to h
      * within this tick. Shared by placementScore (which uses it to compute stranding) and the
      * dispatch loop (which uses it to estimate the frames a single commit will book).
@@ -3107,43 +3332,9 @@ public class Scheduler extends JdbcDaoSupport {
      * The per-call caps host_frame_dispatch_max and job_frame_dispatch_max are not applied here
      * because they bound a single dispatch call, not the per-tick total. The dispatch loop applies
      * job_frame_dispatch_max when estimating a single commit's worth of frames.
+     *
+     * Bound: O(D).
      */
-    /**
-     * Frames one commit may book for candidate c on host best: the minimum of every sizing rule,
-     * each term named. Zero or less means stop booking this candidate this tick. A soft-cap grant
-     * (overCap) skips the per-host layer-cap term; the cap already yielded for this booking.
-     */
-    private int headroomFrames(LayerCandidate c, BookableHost best, boolean overCap,
-            int probeHeadroom, Map<String, Integer> limitUsed, int licenseUsable,
-            Map<String, Integer> folderUsed, int strandFree) {
-        long maxMore = computeMaxMore(best, c);
-        // Commit size: one plan slice.
-        int est = (int) Math.min(frameQueryMax, maxMore + 1);
-        // Backlog: never book frames the layer does not have.
-        est = Math.min(est, c.waitingFrameCount);
-        // Strand bundle: what lies beyond the reach waiting work keeps on this host.
-        est = Math.min(est, strandFree);
-        // Probe: an unproven layer's remaining farm-wide allowance.
-        est = Math.min(est, probeHeadroom);
-        // Named limit: the tick-wide running count is authoritative.
-        if (c.limitId != null)
-            est = Math.min(est, c.limitMax - limitUsed.get(c.limitId));
-        // Licenses: one frame is one seat, floating pools shared tick-wide.
-        if (licenseUsable != Integer.MAX_VALUE)
-            est = Math.min(est, licenseUsable);
-        // Folder ceiling (cores, not frames).
-        if (c.folderMax >= 0 && c.layerCoresMin > 0)
-            est = Math.min(est, (c.folderMax - folderUsed.get(c.folderId)) / c.layerCoresMin);
-        // Per-host layer cap: skipped when the cap already yielded.
-        if (!overCap && layerHostMaxFrac > 0) {
-            int hlCap = layerHostCap(best, c);
-            if (hlCap != Integer.MAX_VALUE)
-                est = Math.min(est,
-                        hlCap - layerFramesOn(best, c));
-        }
-        return est;
-    }
-
     static long computeMaxMore(BookableHost h, LayerCandidate c) {
         long maxMore = Long.MAX_VALUE;
         for (Dim d : DIMS) {
@@ -3181,27 +3372,18 @@ public class Scheduler extends JdbcDaoSupport {
      * such host each candidate is stopped by cores, memory or gpu. The physical counterpart of the
      * waitlist's 'no fit' bucket, counted after planning so cores that just sold are not blamed. A
      * group with nothing waiting strands nothing; idle without demand is just idle.
+     *
+     * Bound: O(W log W + H log W).
      */
     static long strandedWholeCores(List<BookableHost> hosts, List<LayerCandidate> candidates) {
-        List<LayerCandidate> waiting = new ArrayList<>();
-        for (LayerCandidate c : candidates)
-            if (c.waitingFrameCount > 0)
-                waiting.add(c);
-        if (waiting.isEmpty())
+        GroupViews.NeedView need = new GroupViews.NeedView(candidates);
+        if (need.isEmpty())
             return 0;
         long strandedCp = 0;
         for (BookableHost h : hosts) {
             if (h.coresIdle < Dispatcher.CORE_POINTS_RESERVED_MIN)
                 continue;
-            boolean sellable = false;
-            for (LayerCandidate c : waiting) {
-                if (c.layerCoresMin <= h.coresIdle && c.layerMemMin <= h.memIdle
-                        && c.layerGpusMin <= h.gpusIdle && c.layerGpuMemMin <= h.gpuMemIdle) {
-                    sellable = true;
-                    break;
-                }
-            }
-            if (!sellable)
+            if (!need.sellable(h))
                 strandedCp += h.coresIdle;
         }
         return strandedCp / CORE_POINTS_PER_CORE;
@@ -3226,9 +3408,9 @@ public class Scheduler extends JdbcDaoSupport {
 
     /**
      * Record a (host, layer) placement to commit at the end of this tick. Planner-thread only;
-     * doTick drains plannedByHost via planHost + startFramesAndProcsBatch.
+     * doTick drains plannedByHost via planBookings + startFramesAndProcsBatch.
      */
-    private void submitCommit(BookableHost best, String layerId, int estFrames) {
+    void submitCommit(BookableHost best, String layerId, int estFrames) {
         plannedByHost.computeIfAbsent(best.hostId, k -> new ArrayList<>()).add(layerId);
         // Slice bookkeeping: this plan starts where the layer's earlier plans
         // this tick end, so parallel plan reads pull disjoint frames.
@@ -3380,7 +3562,7 @@ public class Scheduler extends JdbcDaoSupport {
                 pointBatch);
     }
 
-    /** Copy out the current deltas and clear the buffer for the next tick. */
+    /** Copy out the current deltas and clear the buffer for the next tick. Bound: O(entries). */
     private static Map<String, long[]> drain(Map<String, long[]> buf) {
         Map<String, long[]> snap = new HashMap<>();
         for (Iterator<Map.Entry<String, long[]>> it = buf.entrySet().iterator(); it.hasNext();) {
@@ -3546,25 +3728,41 @@ public class Scheduler extends JdbcDaoSupport {
      * but not the GPU), or {@code fit} (some host fit fully, so the layer was gated by a
      * reservation or a host-based license seat -- the caller resolves that into held/license).
      * Feeds the waitlist buckets via {@link #waitlistReason}.
+     *
+     * Bound: O(log I) for a CPU need; a GPU need walks its fitting prefix.
      */
-    static String classifyFragmentation(LayerCandidate c, List<BookableHost> hosts) {
-        boolean anyCores = false;
-        boolean anyMem = false;
-        for (BookableHost h : hosts) {
-            if (h.coresIdle < c.layerCoresMin)
-                continue;
-            anyCores = true;
-            if (h.memIdle < c.layerMemMin)
-                continue;
-            anyMem = true;
-            if (h.gpusIdle >= c.layerGpusMin && h.gpuMemIdle >= c.layerGpuMemMin)
+    static String classifyFragmentation(LayerCandidate c, GroupViews.IdleView idle) {
+        int k = idle.fitPrefix(c.layerCoresMin);
+        if (k == 0)
+            return "cores";
+        if (!idle.anyMem(k, c.layerMemMin))
+            return "memory";
+        if (c.layerGpusMin <= 0 && c.layerGpuMemMin <= 0)
+            return "fit";
+        for (int i = 0; i < k; i++) {
+            BookableHost h = idle.byCores[i];
+            if (h.memIdle >= c.layerMemMin && h.gpusIdle >= c.layerGpusMin
+                    && h.gpuMemIdle >= c.layerGpuMemMin)
                 return "fit";
         }
-        if (!anyCores)
-            return "cores";
-        if (!anyMem)
-            return "memory";
         return "gpu";
+    }
+
+    /**
+     * The candidates some idle host of the group fits, the only ones a slot can go to: idle
+     * capacity only falls during the slot loop and a need does not change, so a candidate no host
+     * fits at the prologue places nothing in any slot, and a draw without it keeps its law.
+     *
+     * Bound: O(C log I) after the view's O(I log I) build.
+     */
+    static List<LayerCandidate> fitting(List<LayerCandidate> candidates,
+            GroupViews.IdleView idle) {
+        List<LayerCandidate> kept = new ArrayList<>(candidates.size());
+        for (LayerCandidate c : candidates) {
+            if ("fit".equals(classifyFragmentation(c, idle)))
+                kept.add(c);
+        }
+        return kept;
     }
 
     /**
@@ -3575,26 +3773,31 @@ public class Scheduler extends JdbcDaoSupport {
      * waiting work that needs it (see strandFreeFrames); else {@code share}: every fitting host
      * already holds this layer's per-host share while other work waits (the soft cap yielding to
      * nobody, see othersWant), or was planned for it this tick and takes its next slice next tick.
+     *
+     * Bound: the fitting prefix at most; the held walk covers the reserved hosts, the strand walk
+     * runs only when a dimension couples.
      */
-    private String fitGateReason(LayerCandidate c, List<BookableHost> hosts,
+    private String fitGateReason(LayerCandidate c, GroupViews.IdleView idle,
             List<LicenseSource.LicenseBudget> licenseSeatPools,
-            Map<String, Set<String>> licenseSeats, List<LayerCandidate> candidates,
-            String groupAllocId, Map<String, Integer> jobCoresUsed,
-            Map<String, Integer> showCoresUsed, Map<String, Integer> limitUsed) {
+            Map<String, Set<String>> licenseSeats) {
+        int k = idle.fitPrefix(c.layerCoresMin);
         if (licenseSeatPools != null) {
-            for (BookableHost h : hosts) {
+            for (int i = 0; i < k; i++) {
+                BookableHost h = idle.byCores[i];
                 if (fitsOnHost(c, h) && !licenseSeatsAllow(licenseSeatPools, licenseSeats, h))
                     return "license";
             }
         }
-        for (BookableHost h : hosts) {
+        for (BookableHost h : idle.reserved) {
             if (fitsOnHost(c, h) && !reservationAllows(h, c))
                 return "held";
         }
-        for (BookableHost h : hosts) {
-            if (fitsOnHost(c, h) && strandFreeFrames(h, c, candidates, groupAllocId,
-                    jobCoresUsed, showCoresUsed, limitUsed) <= 0)
-                return "strand";
+        if (reachNeeds != null) {
+            for (int i = 0; i < k; i++) {
+                BookableHost h = idle.byCores[i];
+                if (fitsOnHost(c, h) && strandFreeFrames(h, c) <= 0)
+                    return "strand";
+            }
         }
         return "share";
     }
@@ -3609,12 +3812,10 @@ public class Scheduler extends JdbcDaoSupport {
      * wrong), and {@code no fit} when idle cores exist but none fits (slivers too small for a wide
      * frame, or memory / gpu short): the shape mismatch worth investigating.
      */
-    private String waitlistReason(LayerCandidate c, List<BookableHost> hosts, int limitInUse,
+    private String waitlistReason(LayerCandidate c, GroupViews.IdleView idle, int limitInUse,
             int folderInUse, boolean licenseHeld, int licenseUsable,
             List<LicenseSource.LicenseBudget> licenseSeatPools,
-            Map<String, Set<String>> licenseSeats, List<LayerCandidate> candidates,
-            String groupAllocId, Map<String, Integer> jobCoresUsed,
-            Map<String, Integer> showCoresUsed, Map<String, Integer> limitUsed) {
+            Map<String, Set<String>> licenseSeats) {
         if (c.jobCoresInUse + c.layerCoresMin > c.jobMaxCores
                 || c.showCoresInUse + c.layerCoresMin > c.showBurstCores
                 || (c.limitId != null && limitInUse >= c.limitMax)
@@ -3622,20 +3823,15 @@ public class Scheduler extends JdbcDaoSupport {
             return "limit";
         if (licenseHeld || licenseUsable <= 0)
             return "no license";
-        String fit = classifyFragmentation(c, hosts);
+        String fit = classifyFragmentation(c, idle);
         if ("fit".equals(fit))
-            fit = fitGateReason(c, hosts, licenseSeatPools, licenseSeats, candidates, groupAllocId,
-                    jobCoresUsed, showCoresUsed, limitUsed);
+            fit = fitGateReason(c, idle, licenseSeatPools, licenseSeats);
         if ("held".equals(fit) || "share".equals(fit) || "strand".equals(fit))
             return fit;
         if ("license".equals(fit))
             return "no license";
-        if ("cores".equals(fit)) {
-            long idleSum = 0;
-            for (BookableHost h : hosts)
-                idleSum += h.coresIdle;
-            return idleSum < c.layerCoresMin ? "capacity" : "no fit";
-        }
+        if ("cores".equals(fit))
+            return idle.idleCoresSum < c.layerCoresMin ? "capacity" : "no fit";
         return "no fit";
     }
 
@@ -3676,9 +3872,7 @@ public class Scheduler extends JdbcDaoSupport {
         String pkAlloc;
         String pkFacility;
         int threadMode;
-        // Total capacity. Used by pickReservationTarget to check whether the
-        // host could fit a layer when fully idle, independent of the host's
-        // current load.
+        // consumed by hostCanEverFit()
         int coresTotal;
         long memTotal;
         int gpusTotal;
@@ -3700,6 +3894,13 @@ public class Scheduler extends JdbcDaoSupport {
         long odometer; // consumed by placeOnce() and localityKind()
         Reservation reservation; // consumed by reservationAllows()
         Integer tReady; // consumed by backfillAllows()
+        int coresIdleAtBind; // consumed by dispatchHostOf()
+        long memIdleAtBind; // consumed by dispatchHostOf()
+        int gpusIdleAtBind; // consumed by dispatchHostOf()
+        long gpuMemIdleAtBind; // consumed by dispatchHostOf()
+        int ix; // consumed by pickHost()
+        int stamp; // consumed by HostClasses.candidates()
+        HostClasses.Bucket bucket; // consumed by HostClasses.move()
     }
 
     static final class LayerCandidate {
@@ -3723,8 +3924,14 @@ public class Scheduler extends JdbcDaoSupport {
         int showCoresInUse;
         int showBurstCores;
         int showSizeCores; // consumed by showTier()
-        String showKey; // consumed by showTier()
-        double tier; // consumed by drawSlot()
+        String showKey; // consumed by bindCells()
+        Cell jobCell; // consumed by gate()
+        Cell showCell; // consumed by showTier()
+        Cell limitCell; // consumed by headroomFrames()
+        Cell folderCell; // consumed by headroomFrames()
+        Cell[] licenseCells; // consumed by gate()
+        int drawShow; // consumed by SlotDraw.remove()
+        int drawIx; // consumed by SlotDraw.remove()
         // Number of pending dispatchable (waiting) frames. Initialized from
         // waiting_frame_count in the candidate query; decremented as the
         // layer dispatches in this tick. Reconcile keeps the layer's
@@ -3740,8 +3947,8 @@ public class Scheduler extends JdbcDaoSupport {
         int frameSuccessCount;
         // Limit (license-cap) accounting. limitId is the layer's most-constraining
         // limit (null = no limit); limitMax is that limit's int_max_value;
-        // limitRunning is how many frames of it run farm-wide right now (seed for
-        // the tick-wide limitUsed cap in dispatchGroupWithScoring).
+        // limitRunning is how many frames of it run farm-wide right now (the seed
+        // of the limit cell, see bindCells).
         String limitId;
         int limitMax;
         int limitRunning;
@@ -3751,8 +3958,8 @@ public class Scheduler extends JdbcDaoSupport {
         List<String> licenses;
         // Folder (group/dept) core cap. folderId is the job's folder; folderMax is
         // folder_resource.int_max_cores (-1 = unlimited, core-points); folderRunning
-        // is the folder's current running cores (core-points), seed for the
-        // tick-wide folderUsed cap in dispatchGroupWithScoring.
+        // is the folder's current running cores (core-points), the seed of the
+        // folder cell, see bindCells.
         String folderId;
         int folderMax;
         int folderRunning;
