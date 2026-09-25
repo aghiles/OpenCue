@@ -2,11 +2,13 @@
 
 The pathological shape from production: one layer with thousands of identical
 1-core frames and a huge maxcores. The per-host layer cap is a CONTENTION
-rule: while other work is waiting, no host may give the flood more than its
-share (a quarter of its cores), or one layer starves everyone else machine by
-machine. So this scenario builds real contention first: background jobs are
-submitted and the farm saturates, THEN the flood arrives. The cap must hold
-on every host for the whole run while the background keeps its cores.
+rule among peers: while work of equal or higher priority is waiting, no host
+may give the flood more than its share (a quarter of its cores), or one layer
+starves its peers machine by machine. (Against lower-priority work the cap
+yields: priority decides the share, PRIOLAYERS.) So this scenario builds real
+contention first: background jobs of the flood's own priority are submitted
+and the farm saturates, THEN the flood arrives. The cap must hold on every
+host for the whole run while the background keeps its cores.
 
 The lone-layer case (an idle farm where the cap must YIELD instead of
 stranding cores) is LAYERCAP_SOLO's job, not this one.
@@ -25,7 +27,11 @@ import farm_spec as spec
 CUEBOT = spec.GRPC
 DURATION = int(sys.argv[1]) if len(sys.argv) > 1 else 180
 FRAMES = int(os.environ.get("SIM_LAYERCAP_FRAMES", "20000"))
-BG_JOBS = int(os.environ.get("SIM_LAYERCAP_BG_JOBS", "8"))
+# Four: enough peers to fill every host under their own caps, so the cap
+# never yields for want of a taker (a 128-core host holds 4 x 32), and few
+# enough that the flood's fifth of the slots reaches its caps, so the cap is
+# tested at its edge, not from below.
+BG_JOBS = int(os.environ.get("SIM_LAYERCAP_BG_JOBS", "4"))
 BG_FRAMES = int(os.environ.get("SIM_LAYERCAP_BG_FRAMES", "3000"))
 SATURATE_UTIL = 85.0
 SATURATE_WAIT_S = 90
@@ -80,10 +86,9 @@ def main():
             break
         time.sleep(3)
     print(f"farm at {util_pct():.0f}% util; releasing the flood.", flush=True)
-    # Priority 400 vs the background 100: the flood must actually reach its
-    # capped share so the cap is tested at its edge, not from below.
-    xml = SPEC_HEAD + one_layer_job(f"sim-test-{TOKEN}-00001", FRAMES,
-                                    priority=400) + "</spec>\n"
+    # The flood is the background's peer: at a higher priority the cap would
+    # rightly yield to it.
+    xml = SPEC_HEAD + one_layer_job(f"sim-test-{TOKEN}-00001", FRAMES) + "</spec>\n"
     stub.LaunchSpec(job_pb2.JobLaunchSpecRequest(spec=xml))
     print(f"LAYERCAP flood: one layer, {FRAMES} 1-core frames, against a "
           f"busy farm, staying up {DURATION}s.", flush=True)

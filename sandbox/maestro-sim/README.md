@@ -50,6 +50,7 @@ torn-down sim that writes its own graphs — then prints a PASS/FAIL summary
 | **OOM** | memory failures bump the layer's memory per-frame (no legacy ratchet) and frames retry |
 | **PRIORITY** | completion share is *ordered by priority* across 10 classes (Spearman rho) |
 | **PRIORITY_STARVING** | a low-priority stream survives a high-priority flood (stays above a 3% floor) |
+| **PRIOLAYERS** | on one managed show, a one-layer job at priority 80 holds most of the cores against an eight-layer job at priority 30 (job priority beats layer count) |
 | **RESERVATIONS** | stranded wide jobs are rescued by reservations + backfill and actually run |
 | **LIMIT** | a global license cap (`limit_record.int_max_value`) holds concurrent running frames at the cap under a deep backlog |
 | **LICENSE** | LIVE application licenses as limits (hengine `HOST`, katana + maya `FRAME`) served by a fake license server that counts the farm's own usage AND artist holds, fed to cuebot by an external reporter over `LimitInterface.ReportUsage`: no pool ever oversubscribed, seats shared on host-based pools, unlicensed control unaffected, artists get seats mid-run (headroom the reporter withholds), denials requeued with zero retries |
@@ -128,6 +129,7 @@ Run `python metrics.py 120` against a live run anytime.
 | `--compress F` | `0.27` | Frame-duration scale (real-minutes → sim-seconds). Higher = longer frames = lower lifecycle rate; keep `hosts/avg_duration` under cuebot's ~120 lifecycle/s ceiling so the farm fills. |
 | `--priority-spread SECS` | `0` | PRIORITY test: 10 classes at pri 10..100 contend with equal backlog; normally driven by `--verify` (pair with a small `--hosts` so it is oversubscribed). |
 | `--priority-starve SECS` | `0` | PRIORITY_STARVING test: a deep high-priority flood; the low stream must stay above a 3% floor. Normally driven by `--verify`. |
+| `--priolayers-test SECS` | `0` | PRIOLAYERS test: a one-layer job at priority 80 against an eight-layer job at priority 30 on one managed show; the priority-80 job must hold at least 60% of the contested cores. Normally driven by `--verify`. |
 | `--limit-test SECS` | `0` | LIMIT test: attach one global license cap (`SIM_LIMIT_MAX`, default 50) to a deep flood of 1-core frames and assert concurrent running never exceeds it. Normally driven by `--verify`. |
 | `--license-test SECS` | `0` | LICENSE test: start the fake license server (fake_license.py) plus its reporter (license_reporter.py) and flood layers bound to the licence limits; assert no pool ever oversubscribed, seats shared, unlicensed control unaffected, artists get seats mid-run, denials requeued for free. `SIM_LIC_NO_HOSTS=1` serves counts only (the SESI shape). Normally driven by `--verify`. |
 | `--with-licenses` | off | run the licensed load ALONGSIDE another scenario (used by FAILOVER) so the promoted standby is proven to take over the pools without oversubscribing. |

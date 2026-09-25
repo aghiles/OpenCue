@@ -330,25 +330,36 @@ between Cuebots, and its only cost is one mostly idle connection per Cuebot.
 
 The candidate query does **not** order strictly by priority. It draws a
 **priority-weighted lottery** — Efraimidis-Spirakis weighted reservoir sampling:
-each eligible layer gets a random key `power(random(), 1.0 / GREATEST(priority, 1))`
-and the top `layer_candidates_per_group_max` by that key are taken
+each eligible layer gets a random key `power(random(), 1.0 / weight)` with
+`weight = GREATEST(priority, 1) ^ 1.5` (`PRIORITY_EXPONENT`), and the top
+`layer_candidates_per_group_max` by that key are taken
 (`ORDER BY power(random(), 1.0/…) DESC LIMIT …` in `SELECT_CANDIDATES_FOR_GROUP`).
-A layer's expected selection rate is proportional to its priority, so **priority
+A layer's expected selection rate is proportional to its weight, so **priority
 is a rate, not a rank.** This is the single most operator-visible change from the
 legacy dispatcher, which sorted strictly by `priority DESC` and so gave every free
 core to the highest-priority work until it drained — starving everything below it
 while a high-priority backlog stayed full.
 
 **What this means for operators.** Priority now buys a *share*, not dominance. A
-show at priority 120 vs one at 100 wins roughly `120/(120+100) ≈ 55%` of the
-contested selections, not 100%. Two consequences:
+job at priority 80 vs one at 30 wins roughly `80^1.5/(80^1.5+30^1.5) ≈ 81%` of
+the contested selections, not 100%. Two consequences:
 
-- **Re-spread clustered values.** If your priority numbers were calibrated for
-  rank semantics they often cluster in a narrow band (e.g. 90–110). Under the
-  lottery that band barely differentiates — 110 vs 90 is only a `≈1.22×` rate
-  edge. To get meaningful separation, spread the values (e.g. 50 / 100 / 400).
+- **The curve is steeper than linear, on purpose.** Priority numbers calibrated
+  for rank semantics cluster in a narrow band (e.g. 90–110); linear weights would
+  make 110 vs 90 a `≈1.2×` rate edge. The power of 1.5 makes it `≈1.35×`, 100 vs
+  50 `≈2.8×`, and 300 vs 100 `≈5.2×`, while the lowest priority keeps enough of
+  its share that a deep high-priority flood never starves it (PRIORITY_STARVING).
+- **Priority is a job's, shared by its layers.** In the placement draw
+  (`headWeight`) a job's weight is its priority however many of its layers are
+  in the draw, so a job of eight layers draws like a job of one instead of
+  eight times as often; a layer may plan several slices on one host in a
+  tick, every slot the draw gives it; and the per-host layer cap (§3.8,
+  `share`) holds only against work of equal or higher priority waiting for
+  the host. A job at 80 against a job at 30 holds about `80/110` of the
+  contested cores whatever their layer counts; the PRIOLAYERS scenario
+  asserts it.
 - **It is a rate, not a guarantee.** The *realized* share of completed frames also
-  depends on backlog composition: a stream with far more waiting layers is
+  depends on backlog composition: a stream with far more waiting jobs is
   over-represented in the candidate pool, so it lands more selections than its
   bare priority ratio suggests, and a thin low-priority stream lands fewer. The
   firm guarantee the lottery provides is **anti-starvation** — any eligible layer
@@ -515,9 +526,8 @@ fits (slivers too small for a wide frame, or memory / gpu short): the shape
 mismatch worth investigating. `limit` = a job, show or folder cap. `no license` = an enforced
 limit's budget (frame tokens or machine seats) is exhausted. `held` = every fitting host is
 reserved for a wide job. `share` = every fitting host already holds the layer's
-per-host share (the soft cap, `maestro.layer_host_max_frac`) while other work
-could still place there, or was planned for
-the layer this tick and takes its next slice next tick. `no host` = the
+per-host share (the soft cap, `maestro.layer_host_max_frac`) while work of
+equal or higher priority could still place there. `no host` = the
 layer's tags name no host at all (a stale machine list, §3.10). The buckets
 reuse the why-not precedence
 (`waitlistReason`), cost no extra query, and are published as the gauge
@@ -763,7 +773,7 @@ already takes most of the load off it.
 | `maestro.locality_window_frames` | `64` | Cache-warmth window (§3.7): a vacated host keeps a decayed pull on its layer until this many foreign frames have displaced its cache. 0 disables. |
 | `maestro.stat_interval_seconds` | `300` | Cadence of the consolidated INFO `Maestro stat:` line (Maestro health, farm fill, throughput, reservations). Lower it for live debugging. |
 | `maestro.host_limit_seat_bonus` | `16.0` | Score bonus per HOST-type limit the host already holds a seat in; packs limited work onto the fewest machines. |
-| `maestro.layer_host_max_frac` | `0.25` | SOFT per-host layer cap: one layer may hold at most this fraction of a host's cores (as frames, floor 8), so a flood spills across hosts instead of blanketing one. The cap yields when it is the only blocker: a fitting idle host that only the cap refuses is given to the layer (rss-proven layers only), so a lone farm-sized layer fills the farm instead of stranding it. On a busy farm no such host exists and the cap holds. 0 disables. |
+| `maestro.layer_host_max_frac` | `0.25` | SOFT per-host layer cap: one layer may hold at most this fraction of a host's cores (as frames, floor 8), so a flood spills across hosts instead of blanketing one. The cap yields when it is the only blocker: a fitting idle host that only the cap refuses is given to the layer (rss-proven layers only), so a lone farm-sized layer fills the farm instead of stranding it. It holds only against work of equal or higher priority: lower-priority work never keeps a host from the layer the draw picked. 0 disables. |
 | `maestro.mem_per_core` | `0` | Memory-per-core ratio (KB) for rss-driven layer sizing (§3.9). 0 (the default) derives it from each group's own hosts; set e.g. 4194304 to pin 4G/core studio-wide. |
 | `maestro.plan_zero_warn_ticks` | `40` | Consecutive ticks a layer may plan but commit zero frames before a WARN names it (a commit-time gate Maestro does not model is rejecting it). |
 | `dispatcher.job_frame_dispatch_max` | `8` | The legacy per-call cap on a job's bookings; a Maestro slice is sized by the planner and delivered whole. |

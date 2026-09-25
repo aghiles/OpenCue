@@ -398,6 +398,7 @@ WORKLOAD_PATTERNS = ["feed.py", "inject_big.py", "inject_priority_starve.py",
                      "inject_slice.py", "slice_watch.py",
                      "inject_gpustrand.py", "gpustrand_watch.py",
                      "inject_showtier.py", "showtier_watch.py",
+                     "inject_priolayers.py", "priolayers_watch.py",
                      "inject_budget.py", "budget_watch.py",
                      "inject_memstrand.py", "memstrand_watch.py",
                      "inject_completionstorm.py", "completionstorm_watch.py",
@@ -1178,6 +1179,13 @@ def start_memstrand_injector(duration):
     spawn(["inject_memstrand.py", str(duration)], f"{FARM}/inject_memstrand.log")
 
 
+def start_priolayers_injector(duration):
+    log(f"starting PRIOLAYERS flood (one show, a one-layer job at priority 80 "
+        f"against a many-layer job at priority 30) for {duration}s ...")
+    spawn(["inject_priolayers.py", str(duration)],
+          f"{FARM}/inject_priolayers.log")
+
+
 def start_budget_injector(duration):
     log(f"starting BUDGET (four shows: size orders, burst lends) for {duration}s ...")
     spawn(["inject_budget.py", str(duration)], f"{FARM}/inject_budget.log")
@@ -1622,6 +1630,22 @@ def _verify_check(name, gdir, logp, cblog):
                     f"{tm.group(1) if tm else '?'} showB {tm.group(2) if tm else '?'}, "
                     f"gap {tm.group(3) if tm else '?'}, peak util "
                     f"{um.group(1) if um else '?'}%")
+    if name == "PRIOLAYERS":
+        # The watcher's verdict is the whole check: the priority-80 job holds
+        # most of the contested cores over the last 30 s. Fail-first: the
+        # per-layer draw and per-host layer cap hand them to the priority-30
+        # job with more layers.
+        try:
+            txt = open(logp, errors="ignore").read()
+        except Exception:
+            txt = ""
+        sm = re.search(r"mean hi share ([0-9.]+); lo/hi cores ([0-9.inf]+)x", txt)
+        um = re.search(r"peak util ([0-9.]+)%", txt)
+        ok = bool(re.search(r"(?m)^PASS:", txt))
+        return ok, (f"priority over layer count: hi share "
+                    f"{sm.group(1) if sm else '?'}, lo/hi cores "
+                    f"{sm.group(2) if sm else '?'}x, peak util "
+                    f"{um.group(1) if um else '?'}%")
     if name == "SLICE":
         # The watcher's verdict is the whole check: every large host's first
         # slice is the accounted size. Fail-first: the per-call cap cuts it.
@@ -1951,10 +1975,11 @@ def run_verify():
         ("CAPDROP", ["--hosts", "3,4,10", "--capdrop-test", str(D)]),
         # LAYERCAP: one deep 1-core layer floods a small farm with the per-host
         # layer cap on (25% of a host's cores per layer, floor 8 frames) while
-        # background jobs keep the farm CONTENDED. No host may give the flood
-        # more than its share while others wait (the production 128-on-one
-        # pile-up). Default compress so background churn keeps real contention
-        # alive for the whole window.
+        # background jobs of the flood's own priority keep the farm CONTENDED.
+        # No host may give the flood more than its share while its peers wait
+        # (the production 128-on-one pile-up); against lower-priority work the
+        # cap yields, see PRIOLAYERS. Default compress so background churn
+        # keeps real contention alive for the whole window.
         ("LAYERCAP", ["--hosts", "3,4,10", "--layercap-test", str(max(D, 240))],
          {"SIM_LAYER_HOST_MAX_FRAC": "0.25"}),
         # LAYERCAP_SOLO: the same flood ALONE on an idle farm. The per-host
@@ -2021,6 +2046,14 @@ def run_verify():
         # half, so the small show runs at twice its size.
         ("SHOWTIER", ["--hosts", "3,4,10", "--showtier-test", str(max(D, 180))],
          {"SIM_DUR_LONG_S": "90"}),
+        # PRIOLAYERS: job priority against layer count on one managed show, the
+        # production rollout shape. A one-layer job at priority 80 and an
+        # eight-layer job at priority 30 flood the farm; the legacy job walk
+        # gives the cores to priority 80. Fail-first: the slot draw is per
+        # layer and each layer is capped to a quarter of every host, so the
+        # eight layers outdraw the one and hold several times its cores.
+        ("PRIOLAYERS", ["--hosts", "3,4,10", "--priolayers-test", str(max(D, 180))],
+         {"SIM_DUR_LONG_S": "90", "SIM_MAESTRO_ENABLED": "managed"}),
         # BUDGET: size and burst together, four shows on one allocation with
         # production-style budgets. showA alone must fill the farm past its
         # burst; with all four flooding, the farm splits by size and no show
@@ -2416,6 +2449,11 @@ def main():
                          "farm. Assert that the allocation splits in proportion to "
                          "subscription size (equal tiers) with nobody above burst, "
                          "the legacy dispatcher's show walk.")
+    ap.add_argument("--priolayers-test", type=int, default=0, metavar="SECS",
+                    help="PRIOLAYERS test: on one managed show, a one-layer job at "
+                         "priority 80 contends with an eight-layer job at priority 30. "
+                         "Assert that the higher-priority job holds most of the "
+                         "contested cores, the legacy dispatcher's job walk.")
     ap.add_argument("--strandgrow-test", type=int, default=0, metavar="SECS",
                     help="STRANDGROW test: flood threadable 1-core layers "
                          "whose frames really hold 18G of rss and assert the "
@@ -2806,6 +2844,8 @@ def main():
         start_gpustrand_injector(args.gpustrand_test)
     if args.showtier_test:
         start_showtier_injector(args.showtier_test)
+    if args.priolayers_test:
+        start_priolayers_injector(args.priolayers_test)
     if args.budget_test:
         start_budget_injector(args.budget_test)
     if args.memstrand_test:
@@ -2836,6 +2876,7 @@ def main():
              or args.health_test or args.strandgrow_test or args.migrate_test
              or args.slice_test
              or args.gpustrand_test or args.showtier_test or args.budget_test
+             or args.priolayers_test
              or args.memstrand_test
              or args.completionstorm_test
              or args.doublerender_test
@@ -2918,6 +2959,11 @@ def main():
             f"for {args.showtier_test}s ...")
         subprocess.run([VENV_PY, "showtier_watch.py",
                         str(args.showtier_test), "3"], cwd=FARM)
+    elif args.priolayers_test:
+        log(f"watching PRIOLAYERS (job priority against layer count) "
+            f"for {args.priolayers_test}s ...")
+        subprocess.run([VENV_PY, "priolayers_watch.py",
+                        str(args.priolayers_test), "3"], cwd=FARM)
     elif args.completionstorm_test:
         log(f"watching COMPLETIONSTORM (completion rate vs the post-op "
             f"worker) for {args.completionstorm_test}s ...")
